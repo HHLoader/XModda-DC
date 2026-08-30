@@ -563,25 +563,36 @@ async def timeout(interaction: discord.Interaction, user: discord.Member, minute
     confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
     await interaction.response.send_message(embed=confirm_embed)  # public
 
-@bot.tree.command(name="purge", description="Delete messages")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def purge(interaction: discord.Interaction, amount: int):
-    if amount < 1 or amount > 100:
-        await interaction.response.send_message("Amount must be between 1 and 100.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=amount)
-    await interaction.followup.send(f"Deleted {len(deleted)} messages.", ephemeral=True)
-
 @bot.tree.command(name="warn", description="Warn a member")
 @app_commands.checks.has_permissions(manage_messages=True)
 async def warn(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
+    # Attempt to DM the user
+    dm_sent = await send_dm_embed(user, "warned", reason, interaction.guild.name)
+
+    # Save warning
     user_id = str(user.id)
     if user_id not in warnings:
         warnings[user_id] = []
-    warnings[user_id].append({"reason": reason, "warned_by": interaction.user.id, "timestamp": datetime.datetime.utcnow().isoformat()})
+    warnings[user_id].append({
+        "reason": reason,
+        "warned_by": interaction.user.id,
+        "timestamp": datetime.datetime.utcnow().isoformat()
+    })
     save_warnings()
-    await interaction.response.send_message(f"Warned {user.mention}. They now have {len(warnings[user_id])} warning(s).", ephemeral=True)
+
+    # Public confirmation embed
+    warn_embed = discord.Embed(
+        title="Member Warned",
+        description=f"{user.mention} has been warned.",
+        color=0xffa500,
+        timestamp=datetime.datetime.utcnow()
+    )
+    warn_embed.add_field(name="Reason", value=reason, inline=False)
+    warn_embed.add_field(name="Warning Count", value=len(warnings[user_id]), inline=False)
+    warn_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
+    warn_embed.set_footer(text=f"Moderator: {interaction.user}")
+
+    await interaction.response.send_message(embed=warn_embed)  # public
 
 @bot.tree.command(name="warnings", description="View warnings for a user")
 async def warnings_cmd(interaction: discord.Interaction, user: discord.Member):
