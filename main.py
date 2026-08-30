@@ -173,7 +173,7 @@ async def on_ready():
     bot.add_view(CreateTicketView())
     bot.add_view(CloseTicketView())
 
-    # Sync commands globally (old commands will be replaced)
+    # Sync globally (old commands will be replaced)
     try:
         synced = await bot.tree.sync()
         print(f'Synced {len(synced)} commands')
@@ -181,6 +181,16 @@ async def on_ready():
         print(f'Failed to sync commands: {e}')
 
     print('Bot is ready.')
+
+# --- Prefix sync command (for troubleshooting) ---
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def sync(ctx):
+    try:
+        await bot.tree.sync()
+        await ctx.send("Slash commands synced globally.")
+    except Exception as e:
+        await ctx.send(f"Sync failed: {e}")
 
 # --- Slash Command Group ---
 ticket_config_group = app_commands.Group(name="ticket_config", description="Configure the ticket system (Admin only)")
