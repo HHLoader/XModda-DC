@@ -25,12 +25,17 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Configuration file
 CONFIG_FILE = 'config.json'
 DEFAULT_CONFIG = {
     "ticket_category_id": None,
     "staff_role_id": None,
-    "log_channel_id": None
+    "log_channel_id": None,
+    "panel_embed_title": "Support Tickets",
+    "panel_embed_description": "Click the button below to open a support ticket.",
+    "panel_embed_color": 0x00ff00,  # green
+    "opened_embed_title": "Ticket Created",
+    "opened_embed_description": "Welcome {user}! Please describe your issue. Staff will assist shortly.\n\nUse the button below to close this ticket.",
+    "opened_embed_color": 0x0000ff  # blue
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -67,52 +72,43 @@ class CloseTicketView(discord.ui.View):
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket")
     async def close_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Disable button immediately to prevent multiple clicks
+        # Disable button immediately
         button.disabled = True
         await interaction.response.edit_message(view=self)
 
         # Send countdown message
         countdown_msg = await interaction.channel.send("Closing ticket in 5 seconds...")
-        await asyncio.sleep(5)
+        for i in range(5, 0, -1):
+            await asyncio.sleep(1)
+            await countdown_msg.edit(content=f"Closing ticket in {i} seconds...")
 
-        # Save transcript
+        # Save transcript and delete
         await save_transcript(interaction.channel, interaction.guild)
-
-        # Delete channel
         await interaction.channel.delete()
 
 async def create_ticket(interaction: discord.Interaction):
     guild = interaction.guild
     member = interaction.user
 
-    # Check config
     category_id = config.get("ticket_category_id")
     staff_role_id = config.get("staff_role_id")
 
-    if category_id is None:
-        await interaction.response.send_message("Ticket category is not set. An admin must use `/set_ticket_category` first.", ephemeral=True)
-        return
-    if staff_role_id is None:
-        await interaction.response.send_message("Staff role is not set. An admin must use `/set_staff_role` first.", ephemeral=True)
+    if category_id is None or staff_role_id is None:
+        await interaction.response.send_message("Ticket category or staff role not set. Admins must use `/ticket_config` first.", ephemeral=True)
         return
 
     category = guild.get_channel(category_id)
     staff_role = guild.get_role(staff_role_id)
 
-    if category is None:
-        await interaction.response.send_message("Configured category no longer exists. Please update with `/set_ticket_category`.", ephemeral=True)
-        return
-    if staff_role is None:
-        await interaction.response.send_message("Configured staff role no longer exists. Please update with `/set_staff_role`.", ephemeral=True)
+    if category is None or staff_role is None:
+        await interaction.response.send_message("Configured category or role no longer exists. Please update with `/ticket_config`.", ephemeral=True)
         return
 
-    # Check for existing open ticket (same naming convention)
     existing = discord.utils.get(guild.text_channels, name=f'ticket-{member.name.lower()}')
     if existing:
         await interaction.response.send_message("You already have an open ticket!", ephemeral=True)
         return
 
-    # Create channel
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
@@ -125,11 +121,11 @@ async def create_ticket(interaction: discord.Interaction):
         overwrites=overwrites
     )
 
-    # Initial message with close button
+    # Build opened embed using config
     embed = discord.Embed(
-        title="Ticket Created",
-        description=f"Welcome {member.mention}! Please describe your issue. Staff will assist shortly.\n\nUse the button below to close this ticket.",
-        color=discord.Color.blue(),
+        title=config.get("opened_embed_title", "Ticket Created"),
+        description=config.get("opened_embed_description", "Welcome {user}!").replace("{user}", member.mention),
+        color=config.get("opened_embed_color", 0x0000ff),
         timestamp=datetime.datetime.utcnow()
     )
     embed.set_footer(text=f"Ticket ID: {ticket_channel.id}")
@@ -137,7 +133,6 @@ async def create_ticket(interaction: discord.Interaction):
     close_view = CloseTicketView()
     await ticket_channel.send(embed=embed, view=close_view)
 
-    # Log creation if log channel set
     log_channel_id = config.get("log_channel_id")
     if log_channel_id:
         log_channel = guild.get_channel(log_channel_id)
@@ -147,7 +142,6 @@ async def create_ticket(interaction: discord.Interaction):
     await interaction.response.send_message(f"Ticket created: {ticket_channel.mention}", ephemeral=True)
 
 async def save_transcript(channel, guild):
-    """Save transcript as HTML and send to log channel if configured."""
     transcript_lines = []
     async for message in channel.history(limit=1000, oldest_first=True):
         timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
@@ -177,15 +171,12 @@ async def save_transcript(channel, guild):
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
-    # Start web server
     threading.Thread(target=run_web_server, daemon=True).start()
     print('Web server started for UptimeRobot')
 
-    # Add persistent views to bot
     bot.add_view(CreateTicketView())
     bot.add_view(CloseTicketView())
 
-    # Sync slash commands
     try:
         synced = await bot.tree.sync()
         print(f'Synced {len(synced)} commands')
@@ -194,46 +185,139 @@ async def on_ready():
 
     print('Bot is ready.')
 
-# --- Slash Commands ---
-@bot.tree.command(name="set_ticket_category", description="Set the category where new tickets will be created (Admin)")
+# --- Slash Command Group ---
+@bot.tree.command(name="ticket_config", description="Configure the ticket system (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
-async def set_ticket_category(interaction: discord.Interaction, category: discord.CategoryChannel):
+async def ticket_config(interaction: discord.Interaction):
+    # This is a parent command; we'll use subcommands below.
+    pass
+
+# Subcommand: Set Category
+@ticket_config.command(name="set_category", description="Set the category for new tickets")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
     config["ticket_category_id"] = category.id
     save_config()
     await interaction.response.send_message(f"Ticket category set to {category.mention}", ephemeral=True)
 
-@bot.tree.command(name="set_staff_role", description="Set the role that can see tickets (Admin)")
+# Subcommand: Set Staff Role
+@ticket_config.command(name="set_staff_role", description="Set the role that can see tickets")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_staff_role(interaction: discord.Interaction, role: discord.Role):
     config["staff_role_id"] = role.id
     save_config()
     await interaction.response.send_message(f"Staff role set to {role.mention}", ephemeral=True)
 
-@bot.tree.command(name="set_log_channel", description="Set the channel for ticket logs/transcripts (Admin)")
+# Subcommand: Set Log Channel
+@ticket_config.command(name="set_log_channel", description="Set the channel for ticket logs/transcripts")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     config["log_channel_id"] = channel.id
     save_config()
     await interaction.response.send_message(f"Log channel set to {channel.mention}", ephemeral=True)
 
-@bot.tree.command(name="ticket_panel", description="Post the ticket creation panel with button (Admin)")
+# Subcommand: Post Ticket Panel
+@ticket_config.command(name="post_panel", description="Post the ticket creation panel in the current channel")
 @app_commands.checks.has_permissions(administrator=True)
-async def ticket_panel(interaction: discord.Interaction):
-    view = CreateTicketView()
+async def post_panel(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="Support Tickets",
-        description="Click the button below to open a support ticket.",
-        color=discord.Color.green()
+        title=config.get("panel_embed_title", "Support Tickets"),
+        description=config.get("panel_embed_description", "Click the button below to open a support ticket."),
+        color=config.get("panel_embed_color", 0x00ff00)
     )
+    view = CreateTicketView()
     await interaction.channel.send(embed=embed, view=view)
     await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
 
-# Error handling for slash commands
-@set_ticket_category.error
-@set_staff_role.error
-@set_log_channel.error
-@ticket_panel.error
-async def command_error(interaction: discord.Interaction, error):
+# Subcommand: Edit Panel Embed (opens modal)
+@ticket_config.command(name="edit_panel_embed", description="Edit the ticket panel embed (title, description, color)")
+@app_commands.checks.has_permissions(administrator=True)
+async def edit_panel_embed(interaction: discord.Interaction):
+    modal = EmbedEditModal(
+        title="Edit Panel Embed",
+        current_title=config.get("panel_embed_title", ""),
+        current_description=config.get("panel_embed_description", ""),
+        current_color=hex(config.get("panel_embed_color", 0x00ff00)),
+        embed_type="panel"
+    )
+    await interaction.response.send_modal(modal)
+
+# Subcommand: Edit Opened Ticket Embed (opens modal)
+@ticket_config.command(name="edit_opened_embed", description="Edit the opened ticket embed (title, description, color)")
+@app_commands.checks.has_permissions(administrator=True)
+async def edit_opened_embed(interaction: discord.Interaction):
+    modal = EmbedEditModal(
+        title="Edit Opened Ticket Embed",
+        current_title=config.get("opened_embed_title", ""),
+        current_description=config.get("opened_embed_description", ""),
+        current_color=hex(config.get("opened_embed_color", 0x0000ff)),
+        embed_type="opened"
+    )
+    await interaction.response.send_modal(modal)
+
+# --- Modal for editing embeds ---
+class EmbedEditModal(discord.ui.Modal):
+    def __init__(self, title, current_title, current_description, current_color, embed_type):
+        super().__init__(title=title)
+        self.embed_type = embed_type
+        self.add_item(
+            discord.ui.TextInput(
+                label="Embed Title",
+                placeholder="Enter title",
+                default=current_title,
+                required=False,
+                max_length=256
+            )
+        )
+        self.add_item(
+            discord.ui.TextInput(
+                label="Embed Description",
+                placeholder="Enter description (use {user} for mention in opened ticket)",
+                default=current_description,
+                style=discord.TextStyle.paragraph,
+                required=False,
+                max_length=4000
+            )
+        )
+        self.add_item(
+            discord.ui.TextInput(
+                label="Embed Color (hex)",
+                placeholder="e.g., #00ff00",
+                default=current_color,
+                required=False,
+                max_length=7
+            )
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        title_val = self.children[0].value.strip()
+        desc_val = self.children[1].value.strip()
+        color_val = self.children[2].value.strip()
+
+        # Parse color
+        try:
+            color_int = int(color_val.lstrip('#'), 16) if color_val else None
+        except ValueError:
+            color_int = None
+            await interaction.response.send_message("Invalid color hex. Using default.", ephemeral=True)
+
+        if self.embed_type == "panel":
+            config["panel_embed_title"] = title_val
+            config["panel_embed_description"] = desc_val
+            if color_int is not None:
+                config["panel_embed_color"] = color_int
+        elif self.embed_type == "opened":
+            config["opened_embed_title"] = title_val
+            config["opened_embed_description"] = desc_val
+            if color_int is not None:
+                config["opened_embed_color"] = color_int
+
+        save_config()
+        await interaction.response.send_message("Embed configuration updated.", ephemeral=True)
+
+# Error handling
+@ticket_config.error
+async def ticket_config_error(interaction: discord.Interaction, error):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("You need administrator permissions to use this command.", ephemeral=True)
     else:
