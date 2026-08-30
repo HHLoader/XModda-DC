@@ -468,7 +468,7 @@ async def avatar(interaction: discord.Interaction, user: discord.User = None):
     embed.set_image(url=user.avatar.url if user.avatar else user.default_avatar.url)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# --- Moderation commands with DM and embeds ---
+# --- Moderation commands with DM and public embeds ---
 async def send_dm_embed(member: discord.Member, action: str, reason: str, guild_name: str):
     """Attempt to send a DM embed to the member before action."""
     embed = discord.Embed(
@@ -508,7 +508,7 @@ async def kick(interaction: discord.Interaction, user: discord.Member, reason: s
     confirm_embed.add_field(name="Reason", value=reason, inline=False)
     confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
     confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
-    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+    await interaction.response.send_message(embed=confirm_embed)  # public
 
 @bot.tree.command(name="ban", description="Ban a member")
 @app_commands.checks.has_permissions(ban_members=True)
@@ -534,7 +534,7 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
     confirm_embed.add_field(name="Reason", value=reason, inline=False)
     confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
     confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
-    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+    await interaction.response.send_message(embed=confirm_embed)  # public
 
 @bot.tree.command(name="timeout", description="Timeout a member")
 @app_commands.checks.has_permissions(moderate_members=True)
@@ -561,7 +561,7 @@ async def timeout(interaction: discord.Interaction, user: discord.Member, minute
     confirm_embed.add_field(name="Reason", value=reason, inline=False)
     confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
     confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
-    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
+    await interaction.response.send_message(embed=confirm_embed)  # public
 
 @bot.tree.command(name="purge", description="Delete messages")
 @app_commands.checks.has_permissions(manage_messages=True)
