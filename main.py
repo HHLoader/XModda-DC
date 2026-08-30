@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
     "panel_embed_title": "Support Tickets",
     "panel_embed_description": "Click the button below to open a support ticket.",
     "panel_embed_color": 0x00ff00,
-    "panel_embed_thumbnail": None,  # URL
+    "panel_embed_thumbnail": None,
     "opened_embed_title": "Ticket Created",
     "opened_embed_description": "Welcome {user}! Please describe your issue. Staff will assist shortly.\n\nUse the buttons below to manage this ticket.",
     "opened_embed_color": 0x0000ff,
@@ -115,7 +115,6 @@ async def create_ticket(interaction: discord.Interaction):
         await interaction.response.send_message("Configured category or role no longer exists. Please update with `/ticket_config`.", ephemeral=True)
         return
 
-    # Check ticket limit
     limit = config.get("ticket_limit", 1)
     open_tickets = [ch for ch in guild.text_channels if ch.name.startswith(f'ticket-{member.name.lower()}') and ch.category_id == category_id]
     if len(open_tickets) >= limit:
@@ -157,7 +156,6 @@ async def create_ticket(interaction: discord.Interaction):
     await interaction.response.send_message(f"Ticket created: {ticket_channel.mention}", ephemeral=True)
 
 async def claim_ticket(interaction: discord.Interaction):
-    # Check if user has staff role
     staff_role_id = config.get("staff_role_id")
     if staff_role_id is None:
         await interaction.response.send_message("Staff role not set.", ephemeral=True)
@@ -167,7 +165,6 @@ async def claim_ticket(interaction: discord.Interaction):
         await interaction.response.send_message("You are not staff.", ephemeral=True)
         return
 
-    # Add user to channel overwrites if not already
     channel = interaction.channel
     if not channel.name.startswith('ticket-'):
         await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
@@ -176,8 +173,6 @@ async def claim_ticket(interaction: discord.Interaction):
     overwrite = discord.PermissionOverwrite(read_messages=True, send_messages=True)
     await channel.set_permissions(interaction.user, overwrite=overwrite)
 
-    # Update embed to show claimed by
-    # Find the original ticket embed message (first message in channel)
     async for msg in channel.history(limit=10, oldest_first=True):
         if msg.author == bot.user and msg.embeds:
             embed = msg.embeds[0]
@@ -188,11 +183,6 @@ async def claim_ticket(interaction: discord.Interaction):
     await interaction.response.send_message("You have claimed this ticket.", ephemeral=True)
 
 async def close_ticket(interaction: discord.Interaction):
-    # Similar to before, but now called from button
-    button = interaction.data.get('custom_id')
-    view = TicketManageView()
-    # Disable both buttons in the message being clicked
-    # We'll just delete the channel after countdown
     countdown_msg = await interaction.channel.send("Closing ticket in 5 seconds...")
     for i in range(5, 0, -1):
         await asyncio.sleep(1)
@@ -255,7 +245,7 @@ async def sync(ctx):
     except Exception as e:
         await ctx.send(f"Sync failed: {e}")
 
-# --- Slash command: ticket_config (dropdown panel) ---
+# --- Ticket Config Dropdown Command ---
 @bot.tree.command(name="ticket_config", description="Open ticket configuration panel (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def ticket_config(interaction: discord.Interaction):
@@ -443,11 +433,7 @@ class EmbedEditModal(discord.ui.Modal):
         save_config()
         await interaction.response.send_message("Embed configuration updated.", ephemeral=True)
 
-# --- Non-ticket slash commands ---
-@bot.tree.command(name="ping", description="Check bot latency")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Pong! Latency: {round(bot.latency * 1000)}ms", ephemeral=True)
-
+# --- Non-ticket slash commands (moderation & utility) ---
 @bot.tree.command(name="userinfo", description="Get information about a user")
 async def userinfo(interaction: discord.Interaction, user: discord.User = None):
     user = user or interaction.user
@@ -482,43 +468,47 @@ async def avatar(interaction: discord.Interaction, user: discord.User = None):
     embed.set_image(url=user.avatar.url if user.avatar else user.default_avatar.url)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="roll", description="Roll a dice")
-async def roll(interaction: discord.Interaction, sides: int = 6):
-    if sides < 2:
-        await interaction.response.send_message("Sides must be at least 2.", ephemeral=True)
-        return
-    result = random.randint(1, sides)
-    await interaction.response.send_message(f"🎲 You rolled a {result} (1-{sides})", ephemeral=False)
+# --- Moderation commands with DM and embeds ---
+async def send_dm_embed(member: discord.Member, action: str, reason: str, guild_name: str):
+    """Attempt to send a DM embed to the member before action."""
+    embed = discord.Embed(
+        title=f"You have been {action}",
+        description=f"**Server:** {guild_name}\n**Reason:** {reason}",
+        color=0xff0000,
+        timestamp=datetime.datetime.utcnow()
+    )
+    embed.set_footer(text="This action was performed by a moderator.")
+    try:
+        await member.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.HTTPException):
+        return False
 
-@bot.tree.command(name="coinflip", description="Flip a coin")
-async def coinflip(interaction: discord.Interaction):
-    result = random.choice(["Heads", "Tails"])
-    await interaction.response.send_message(f"🪙 The coin landed on **{result}**!")
-
-@bot.tree.command(name="8ball", description="Ask the magic 8-ball")
-async def eightball(interaction: discord.Interaction, question: str):
-    responses = [
-        "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes definitely.",
-        "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
-        "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
-        "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
-        "Don't count on it.", "My reply is no.", "My sources say no.", "Outlook not so good.",
-        "Very doubtful."
-    ]
-    await interaction.response.send_message(f"🎱 {random.choice(responses)}")
-
-# --- Moderation commands ---
 @bot.tree.command(name="kick", description="Kick a member")
 @app_commands.checks.has_permissions(kick_members=True)
 async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
     if user.top_role >= interaction.user.top_role:
         await interaction.response.send_message("You cannot kick a member with equal or higher role.", ephemeral=True)
         return
+
+    dm_sent = await send_dm_embed(user, "kicked", reason, interaction.guild.name)
+
     try:
         await user.kick(reason=reason)
-        await interaction.response.send_message(f"Kicked {user.mention} for: {reason}", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"Failed to kick: {e}", ephemeral=True)
+        return
+
+    confirm_embed = discord.Embed(
+        title="Member Kicked",
+        description=f"{user.mention} has been kicked.",
+        color=0xff0000,
+        timestamp=datetime.datetime.utcnow()
+    )
+    confirm_embed.add_field(name="Reason", value=reason, inline=False)
+    confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
+    confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
+    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
 
 @bot.tree.command(name="ban", description="Ban a member")
 @app_commands.checks.has_permissions(ban_members=True)
@@ -526,11 +516,25 @@ async def ban(interaction: discord.Interaction, user: discord.Member, reason: st
     if user.top_role >= interaction.user.top_role:
         await interaction.response.send_message("You cannot ban a member with equal or higher role.", ephemeral=True)
         return
+
+    dm_sent = await send_dm_embed(user, "banned", reason, interaction.guild.name)
+
     try:
         await user.ban(reason=reason)
-        await interaction.response.send_message(f"Banned {user.mention} for: {reason}", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"Failed to ban: {e}", ephemeral=True)
+        return
+
+    confirm_embed = discord.Embed(
+        title="Member Banned",
+        description=f"{user.mention} has been banned.",
+        color=0xff0000,
+        timestamp=datetime.datetime.utcnow()
+    )
+    confirm_embed.add_field(name="Reason", value=reason, inline=False)
+    confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
+    confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
+    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
 
 @bot.tree.command(name="timeout", description="Timeout a member")
 @app_commands.checks.has_permissions(moderate_members=True)
@@ -538,12 +542,26 @@ async def timeout(interaction: discord.Interaction, user: discord.Member, minute
     if user.top_role >= interaction.user.top_role:
         await interaction.response.send_message("You cannot timeout a member with equal or higher role.", ephemeral=True)
         return
+
+    dm_sent = await send_dm_embed(user, "timed out", reason, interaction.guild.name)
+
     duration = datetime.timedelta(minutes=minutes)
     try:
         await user.timeout(duration, reason=reason)
-        await interaction.response.send_message(f"Timed out {user.mention} for {minutes} minutes. Reason: {reason}", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"Failed to timeout: {e}", ephemeral=True)
+        return
+
+    confirm_embed = discord.Embed(
+        title="Member Timed Out",
+        description=f"{user.mention} has been timed out for {minutes} minutes.",
+        color=0xff0000,
+        timestamp=datetime.datetime.utcnow()
+    )
+    confirm_embed.add_field(name="Reason", value=reason, inline=False)
+    confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
+    confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
+    await interaction.response.send_message(embed=confirm_embed, ephemeral=True)
 
 @bot.tree.command(name="purge", description="Delete messages")
 @app_commands.checks.has_permissions(manage_messages=True)
