@@ -25,10 +25,10 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # ========== CONFIGURATION ==========
 # Replace these with your actual Discord IDs
-TICKET_CATEGORY_ID = 1543540666246631506          # Category where ticket channels appear
+TICKET_CATEGORY_ID = 960345930459144273          # Category where ticket channels appear
 STAFF_ROLE_ID = 959492023528882286              # Role that can see tickets
 LOG_CHANNEL_ID = 1509744315658932245             # Channel for logs/transcripts
-TICKET_PANEL_CHANNEL_ID = 1509744166228463737    # Channel where "Create Ticket" button is posted
+TICKET_PANEL_CHANNEL_ID = 1543540666246631506    # Channel where "Create Ticket" button is posted
 # ===================================
 
 @bot.event
