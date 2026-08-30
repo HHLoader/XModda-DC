@@ -32,10 +32,10 @@ DEFAULT_CONFIG = {
     "log_channel_id": None,
     "panel_embed_title": "Support Tickets",
     "panel_embed_description": "Click the button below to open a support ticket.",
-    "panel_embed_color": 0x00ff00,  # green
+    "panel_embed_color": 0x00ff00,
     "opened_embed_title": "Ticket Created",
     "opened_embed_description": "Welcome {user}! Please describe your issue. Staff will assist shortly.\n\nUse the button below to close this ticket.",
-    "opened_embed_color": 0x0000ff  # blue
+    "opened_embed_color": 0x0000ff
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -72,17 +72,14 @@ class CloseTicketView(discord.ui.View):
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket")
     async def close_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Disable button immediately
         button.disabled = True
         await interaction.response.edit_message(view=self)
 
-        # Send countdown message
         countdown_msg = await interaction.channel.send("Closing ticket in 5 seconds...")
         for i in range(5, 0, -1):
             await asyncio.sleep(1)
             await countdown_msg.edit(content=f"Closing ticket in {i} seconds...")
 
-        # Save transcript and delete
         await save_transcript(interaction.channel, interaction.guild)
         await interaction.channel.delete()
 
@@ -121,7 +118,6 @@ async def create_ticket(interaction: discord.Interaction):
         overwrites=overwrites
     )
 
-    # Build opened embed using config
     embed = discord.Embed(
         title=config.get("opened_embed_title", "Ticket Created"),
         description=config.get("opened_embed_description", "Welcome {user}!").replace("{user}", member.mention),
@@ -177,6 +173,7 @@ async def on_ready():
     bot.add_view(CreateTicketView())
     bot.add_view(CloseTicketView())
 
+    # Sync commands globally (old commands will be replaced)
     try:
         synced = await bot.tree.sync()
         print(f'Synced {len(synced)} commands')
@@ -186,14 +183,10 @@ async def on_ready():
     print('Bot is ready.')
 
 # --- Slash Command Group ---
-@bot.tree.command(name="ticket_config", description="Configure the ticket system (Admin only)")
-@app_commands.checks.has_permissions(administrator=True)
-async def ticket_config(interaction: discord.Interaction):
-    # This is a parent command; we'll use subcommands below.
-    pass
+ticket_config_group = app_commands.Group(name="ticket_config", description="Configure the ticket system (Admin only)")
 
 # Subcommand: Set Category
-@ticket_config.command(name="set_category", description="Set the category for new tickets")
+@ticket_config_group.command(name="set_category", description="Set the category for new tickets")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
     config["ticket_category_id"] = category.id
@@ -201,7 +194,7 @@ async def set_category(interaction: discord.Interaction, category: discord.Categ
     await interaction.response.send_message(f"Ticket category set to {category.mention}", ephemeral=True)
 
 # Subcommand: Set Staff Role
-@ticket_config.command(name="set_staff_role", description="Set the role that can see tickets")
+@ticket_config_group.command(name="set_staff_role", description="Set the role that can see tickets")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_staff_role(interaction: discord.Interaction, role: discord.Role):
     config["staff_role_id"] = role.id
@@ -209,7 +202,7 @@ async def set_staff_role(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(f"Staff role set to {role.mention}", ephemeral=True)
 
 # Subcommand: Set Log Channel
-@ticket_config.command(name="set_log_channel", description="Set the channel for ticket logs/transcripts")
+@ticket_config_group.command(name="set_log_channel", description="Set the channel for ticket logs/transcripts")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     config["log_channel_id"] = channel.id
@@ -217,7 +210,7 @@ async def set_log_channel(interaction: discord.Interaction, channel: discord.Tex
     await interaction.response.send_message(f"Log channel set to {channel.mention}", ephemeral=True)
 
 # Subcommand: Post Ticket Panel
-@ticket_config.command(name="post_panel", description="Post the ticket creation panel in the current channel")
+@ticket_config_group.command(name="post_panel", description="Post the ticket creation panel in the current channel")
 @app_commands.checks.has_permissions(administrator=True)
 async def post_panel(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -229,8 +222,8 @@ async def post_panel(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=view)
     await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
 
-# Subcommand: Edit Panel Embed (opens modal)
-@ticket_config.command(name="edit_panel_embed", description="Edit the ticket panel embed (title, description, color)")
+# Subcommand: Edit Panel Embed
+@ticket_config_group.command(name="edit_panel_embed", description="Edit the ticket panel embed (title, description, color)")
 @app_commands.checks.has_permissions(administrator=True)
 async def edit_panel_embed(interaction: discord.Interaction):
     modal = EmbedEditModal(
@@ -242,8 +235,8 @@ async def edit_panel_embed(interaction: discord.Interaction):
     )
     await interaction.response.send_modal(modal)
 
-# Subcommand: Edit Opened Ticket Embed (opens modal)
-@ticket_config.command(name="edit_opened_embed", description="Edit the opened ticket embed (title, description, color)")
+# Subcommand: Edit Opened Ticket Embed
+@ticket_config_group.command(name="edit_opened_embed", description="Edit the opened ticket embed (title, description, color)")
 @app_commands.checks.has_permissions(administrator=True)
 async def edit_opened_embed(interaction: discord.Interaction):
     modal = EmbedEditModal(
@@ -254,6 +247,9 @@ async def edit_opened_embed(interaction: discord.Interaction):
         embed_type="opened"
     )
     await interaction.response.send_modal(modal)
+
+# Add the group to the bot's command tree
+bot.tree.add_command(ticket_config_group)
 
 # --- Modal for editing embeds ---
 class EmbedEditModal(discord.ui.Modal):
@@ -294,7 +290,6 @@ class EmbedEditModal(discord.ui.Modal):
         desc_val = self.children[1].value.strip()
         color_val = self.children[2].value.strip()
 
-        # Parse color
         try:
             color_int = int(color_val.lstrip('#'), 16) if color_val else None
         except ValueError:
@@ -314,14 +309,6 @@ class EmbedEditModal(discord.ui.Modal):
 
         save_config()
         await interaction.response.send_message("Embed configuration updated.", ephemeral=True)
-
-# Error handling
-@ticket_config.error
-async def ticket_config_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("You need administrator permissions to use this command.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
 
 # Run bot
 bot.run(os.environ['DISCORD_TOKEN'])
