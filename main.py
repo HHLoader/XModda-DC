@@ -173,7 +173,6 @@ async def on_ready():
     bot.add_view(CreateTicketView())
     bot.add_view(CloseTicketView())
 
-    # Sync globally (old commands will be replaced)
     try:
         synced = await bot.tree.sync()
         print(f'Synced {len(synced)} commands')
@@ -182,7 +181,7 @@ async def on_ready():
 
     print('Bot is ready.')
 
-# --- Prefix sync command (for troubleshooting) ---
+# --- Prefix sync command ---
 @bot.command()
 @commands.has_permissions(administrator=True)
 async def sync(ctx):
@@ -192,74 +191,121 @@ async def sync(ctx):
     except Exception as e:
         await ctx.send(f"Sync failed: {e}")
 
-# --- Slash Command Group ---
-ticket_config_group = app_commands.Group(name="ticket_config", description="Configure the ticket system (Admin only)")
-
-# Subcommand: Set Category
-@ticket_config_group.command(name="set_category", description="Set the category for new tickets")
+# --- Main Config Command with Dropdown ---
+@bot.tree.command(name="ticket_config", description="Open ticket configuration panel (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
-async def set_category(interaction: discord.Interaction, category: discord.CategoryChannel):
-    config["ticket_category_id"] = category.id
-    save_config()
-    await interaction.response.send_message(f"Ticket category set to {category.mention}", ephemeral=True)
+async def ticket_config(interaction: discord.Interaction):
+    view = ConfigMainView()
+    await interaction.response.send_message("Select an option to configure:", view=view, ephemeral=True)
 
-# Subcommand: Set Staff Role
-@ticket_config_group.command(name="set_staff_role", description="Set the role that can see tickets")
-@app_commands.checks.has_permissions(administrator=True)
-async def set_staff_role(interaction: discord.Interaction, role: discord.Role):
-    config["staff_role_id"] = role.id
-    save_config()
-    await interaction.response.send_message(f"Staff role set to {role.mention}", ephemeral=True)
+class ConfigMainView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.add_item(ConfigMainSelect())
 
-# Subcommand: Set Log Channel
-@ticket_config_group.command(name="set_log_channel", description="Set the channel for ticket logs/transcripts")
-@app_commands.checks.has_permissions(administrator=True)
-async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
-    config["log_channel_id"] = channel.id
-    save_config()
-    await interaction.response.send_message(f"Log channel set to {channel.mention}", ephemeral=True)
+class ConfigMainSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="Set Category", description="Set the category for new tickets", emoji="📁"),
+            discord.SelectOption(label="Set Staff Role", description="Set the role that can see tickets", emoji="👥"),
+            discord.SelectOption(label="Set Log Channel", description="Set the channel for logs/transcripts", emoji="📜"),
+            discord.SelectOption(label="Edit Panel Embed", description="Edit the ticket panel embed", emoji="🎨"),
+            discord.SelectOption(label="Edit Opened Embed", description="Edit the opened ticket embed", emoji="🎫"),
+            discord.SelectOption(label="Post Ticket Panel", description="Post the ticket panel in this channel", emoji="📬")
+        ]
+        super().__init__(placeholder="Choose an option...", min_values=1, max_values=1, options=options)
 
-# Subcommand: Post Ticket Panel
-@ticket_config_group.command(name="post_panel", description="Post the ticket creation panel in the current channel")
-@app_commands.checks.has_permissions(administrator=True)
-async def post_panel(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title=config.get("panel_embed_title", "Support Tickets"),
-        description=config.get("panel_embed_description", "Click the button below to open a support ticket."),
-        color=config.get("panel_embed_color", 0x00ff00)
-    )
-    view = CreateTicketView()
-    await interaction.channel.send(embed=embed, view=view)
-    await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
-
-# Subcommand: Edit Panel Embed
-@ticket_config_group.command(name="edit_panel_embed", description="Edit the ticket panel embed (title, description, color)")
-@app_commands.checks.has_permissions(administrator=True)
-async def edit_panel_embed(interaction: discord.Interaction):
-    modal = EmbedEditModal(
-        title="Edit Panel Embed",
-        current_title=config.get("panel_embed_title", ""),
-        current_description=config.get("panel_embed_description", ""),
-        current_color=hex(config.get("panel_embed_color", 0x00ff00)),
-        embed_type="panel"
-    )
-    await interaction.response.send_modal(modal)
-
-# Subcommand: Edit Opened Ticket Embed
-@ticket_config_group.command(name="edit_opened_embed", description="Edit the opened ticket embed (title, description, color)")
-@app_commands.checks.has_permissions(administrator=True)
-async def edit_opened_embed(interaction: discord.Interaction):
-    modal = EmbedEditModal(
-        title="Edit Opened Ticket Embed",
-        current_title=config.get("opened_embed_title", ""),
-        current_description=config.get("opened_embed_description", ""),
-        current_color=hex(config.get("opened_embed_color", 0x0000ff)),
-        embed_type="opened"
-    )
-    await interaction.response.send_modal(modal)
-
-# Add the group to the bot's command tree
-bot.tree.add_command(ticket_config_group)
+    async def callback(self, interaction: discord.Interaction):
+        selected = self.values[0]
+        if selected == "Set Category":
+            # Show category selection
+            categories = interaction.guild.categories
+            if not categories:
+                await interaction.response.send_message("No categories found.", ephemeral=True)
+                return
+            options = [
+                discord.SelectOption(label=cat.name, value=str(cat.id))
+                for cat in categories[:25]  # Discord limit
+            ]
+            view = discord.ui.View(timeout=60)
+            select = discord.ui.Select(placeholder="Select a category...", options=options)
+            async def category_callback(interaction: discord.Interaction):
+                cat_id = int(select.values[0])
+                config["ticket_category_id"] = cat_id
+                save_config()
+                cat = interaction.guild.get_channel(cat_id)
+                await interaction.response.send_message(f"Ticket category set to {cat.mention}", ephemeral=True)
+            select.callback = category_callback
+            view.add_item(select)
+            await interaction.response.send_message("Select a category:", view=view, ephemeral=True)
+        elif selected == "Set Staff Role":
+            roles = interaction.guild.roles
+            # Exclude @everyone and maybe bot roles? Just list all
+            options = [
+                discord.SelectOption(label=role.name, value=str(role.id))
+                for role in roles if role.name != "@everyone"
+            ][:25]
+            if not options:
+                await interaction.response.send_message("No roles available.", ephemeral=True)
+                return
+            view = discord.ui.View(timeout=60)
+            select = discord.ui.Select(placeholder="Select a role...", options=options)
+            async def role_callback(interaction: discord.Interaction):
+                role_id = int(select.values[0])
+                config["staff_role_id"] = role_id
+                save_config()
+                role = interaction.guild.get_role(role_id)
+                await interaction.response.send_message(f"Staff role set to {role.mention}", ephemeral=True)
+            select.callback = role_callback
+            view.add_item(select)
+            await interaction.response.send_message("Select a role:", view=view, ephemeral=True)
+        elif selected == "Set Log Channel":
+            text_channels = [ch for ch in interaction.guild.channels if isinstance(ch, discord.TextChannel)]
+            if not text_channels:
+                await interaction.response.send_message("No text channels found.", ephemeral=True)
+                return
+            options = [
+                discord.SelectOption(label=ch.name, value=str(ch.id))
+                for ch in text_channels[:25]
+            ]
+            view = discord.ui.View(timeout=60)
+            select = discord.ui.Select(placeholder="Select a log channel...", options=options)
+            async def log_callback(interaction: discord.Interaction):
+                ch_id = int(select.values[0])
+                config["log_channel_id"] = ch_id
+                save_config()
+                ch = interaction.guild.get_channel(ch_id)
+                await interaction.response.send_message(f"Log channel set to {ch.mention}", ephemeral=True)
+            select.callback = log_callback
+            view.add_item(select)
+            await interaction.response.send_message("Select a log channel:", view=view, ephemeral=True)
+        elif selected == "Edit Panel Embed":
+            modal = EmbedEditModal(
+                title="Edit Panel Embed",
+                current_title=config.get("panel_embed_title", ""),
+                current_description=config.get("panel_embed_description", ""),
+                current_color=hex(config.get("panel_embed_color", 0x00ff00)),
+                embed_type="panel"
+            )
+            await interaction.response.send_modal(modal)
+        elif selected == "Edit Opened Embed":
+            modal = EmbedEditModal(
+                title="Edit Opened Ticket Embed",
+                current_title=config.get("opened_embed_title", ""),
+                current_description=config.get("opened_embed_description", ""),
+                current_color=hex(config.get("opened_embed_color", 0x0000ff)),
+                embed_type="opened"
+            )
+            await interaction.response.send_modal(modal)
+        elif selected == "Post Ticket Panel":
+            embed = discord.Embed(
+                title=config.get("panel_embed_title", "Support Tickets"),
+                description=config.get("panel_embed_description", "Click the button below to open a support ticket."),
+                color=config.get("panel_embed_color", 0x00ff00)
+            )
+            view = CreateTicketView()
+            await interaction.channel.send(embed=embed, view=view)
+            await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
 
 # --- Modal for editing embeds ---
 class EmbedEditModal(discord.ui.Modal):
