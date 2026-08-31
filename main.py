@@ -499,7 +499,7 @@ async def open_ticket(i):
 
 class TicketPanelView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label='Open Ticket', style=discord.ButtonStyle.primary, emoji='🎫', custom_id='xmodda:ticket_open')
+    @discord.ui.button(label='Open Ticket', style=discord.ButtonStyle.primary, emoji='🎫', custom_id='xmodda_ticket_open_v3')
     async def open_button(self, i, button): await open_ticket(i)
 
 class TicketManageView(discord.ui.View):
@@ -542,6 +542,36 @@ async def ticket_send(i):
         s=await get_settings(i.guild.id,True); cid=s.get('ticketPanelChannelId') or i.channel.id; ch=i.guild.get_channel(int(cid)) if str(cid).isdigit() else None; msg=await send_ticket_panel_to(i.guild,ch,s); await i.response.send_message(f'✅ Ticket panel sent to {ch.mention}: {msg.jump_url}',ephemeral=True); await send_log(i.guild,'Ticket panel sent',f'{i.user.mention} sent a ticket panel to {ch.mention}.',0x5865F2,'ticket')
     except Exception as ex: await i.response.send_message(embed=err(str(ex)),ephemeral=True)
 
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    """Fallback handler for ticket buttons sent by the dashboard.
+
+    This deliberately handles the panel's custom IDs even if a message was
+    created by the website/API rather than by this bot process. That prevents
+    old or externally-created ticket panels from timing out when the persistent
+    View registry was rebuilt after a restart.
+    """
+    try:
+        if interaction.type is not discord.InteractionType.component:
+            return
+        data = interaction.data or {}
+        custom_id = str(data.get('custom_id') or '')
+        if custom_id not in {'xmodda:ticket_open', 'xmodda_ticket_open_v3'}:
+            return
+        if interaction.response.is_done():
+            return
+        await open_ticket(interaction)
+    except Exception as ex:
+        log.exception('Ticket component fallback failed')
+        try:
+            msg = f'❌ Ticket button failed: {str(ex)[:800]}'
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
+
 @bot.tree.error
 async def on_app_command_error(i,error):
     log.error('Command error: %r', error)
@@ -554,9 +584,16 @@ async def on_app_command_error(i,error):
         else: await i.response.send_message(msg,ephemeral=True)
     except discord.HTTPException: pass
 
+async def setup_hook():
+    # Register persistent views after the Discord client is initialized.
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketManageView())
+    log.info('Persistent ticket views registered.')
+
+bot.setup_hook = setup_hook
+
 def main():
     threading.Thread(target=run_health, daemon=True).start()
-    bot.add_view(TicketPanelView()); bot.add_view(TicketManageView())
     bot.run(DISCORD_TOKEN)
 
 if __name__ == '__main__': main()
