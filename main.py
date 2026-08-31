@@ -1,98 +1,46 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
-import asyncio
 import os
-import datetime
-import json
-import random
-import threading
 import re
+import json
+import asyncio
+import datetime as dt
 from collections import defaultdict, deque
+from typing import Any, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+import discord
+from discord import app_commands
+from discord.ext import commands
 from flask import Flask
 
-# --- Web server for UptimeRobot ---
-app = Flask(__name__)
+# ============================================================
+# XMODDA — FULL DISCORD BOT
+# Database: Supabase REST API
+# Runtime: Render / any Python host
+# ============================================================
 
-@app.route('/')
-def home():
-    return "Alive"
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+PORT = int(os.getenv("PORT", "8080"))
 
-def run_web_server():
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+if not DISCORD_TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is missing.")
 
-# --- Discord bot setup ---
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+# ---------- Health server ----------
+health = Flask(__name__)
 
-CONFIG_FILE = 'config.json'
-WARNINGS_FILE = 'warnings.json'
-DEFAULT_CONFIG = {
-    "ticket_category_id": None,
-    "staff_role_id": None,
-    "log_channel_id": None,
-    "panel_embed_title": "Support Tickets",
-    "panel_embed_description": "Click the button below to open a support ticket.",
-    "panel_embed_color": 0x00ff00,
-    "panel_embed_thumbnail": None,
-    "opened_embed_title": "Ticket Created",
-    "opened_embed_description": "Welcome {user}! Please describe your issue. Staff will assist shortly.\n\nUse the buttons below to manage this ticket.",
-    "opened_embed_color": 0x0000ff,
-    "opened_embed_thumbnail": None,
-    "ticket_limit": 1
-}
+@health.get("/")
+def health_root():
+    return "XModda is online"
 
-config = DEFAULT_CONFIG.copy()
-warnings = {}
 
-def load_config():
-    global config
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        config = DEFAULT_CONFIG.copy()
-        save_config()
-    except json.JSONDecodeError:
-        config = DEFAULT_CONFIG.copy()
+def run_health():
+    health.run(host="0.0.0.0", port=PORT)
 
-def save_config():
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=4)
-
-def load_warnings():
-    global warnings
-    try:
-        with open(WARNINGS_FILE, 'r') as f:
-            warnings = json.load(f)
-    except FileNotFoundError:
-        warnings = {}
-    except json.JSONDecodeError:
-        warnings = {}
-
-def save_warnings():
-    with open(WARNINGS_FILE, 'w') as f:
-        json.dump(warnings, f, indent=4)
-
-load_config()
-load_warnings()
-
-# --- Dashboard / Supabase AutoMod integration ---
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-AUTOMOD_CACHE_TTL = 15
-_automod_cache = {}
-_automod_cache_times = {}
-_spam_history = defaultdict(deque)
-_duplicate_history = defaultdict(deque)
-_join_history = defaultdict(deque)
-
-AUTOMOD_DEFAULTS = {
+# ---------- Constants ----------
+DEFAULTS = {
+    # AutoMod
     "antiSpam": False,
     "antiLinks": False,
     "antiInvites": False,
@@ -108,744 +56,603 @@ AUTOMOD_DEFAULTS = {
     "raidJoinLimit": 8,
     "raidWindow": 10,
     "timeoutMinutes": 5,
-    "badWordsList": []
+    "badWordsList": [],
+    "ignoredChannels": [],
+    "bypassRoles": [],
+    # Logging
+    "logging": False,
+    "logChannelId": None,
+    # Welcome
+    "welcome": False,
+    "welcomeChannelId": None,
+    "welcomeMessage": "Welcome {user} to **{server}**! You are member #{count}.",
+    # Auto role
+    "autoRole": False,
+    "autoRoleId": None,
+    # Tickets
+    "tickets": True,
+    "ticketCategoryId": None,
+    "ticketStaffRoleId": None,
+    "ticketPanelChannelId": None,
+    "ticketLimit": 1,
+    # Misc
+    "prefix": "!",
 }
 
-URL_RE = re.compile(r"(?:https?://|www\.)\S+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|gg|io|co|me|tv|dev|xyz|info|site|online|app|ly)\b", re.I)
-INVITE_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[A-Za-z0-9-]+", re.I)
+URL_RE = re.compile(
+    r"(?:https?://|www\.)\S+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|gg|io|co|me|tv|dev|xyz|info|site|online|app|ly|us|uk|ca)\b",
+    re.I,
+)
+INVITE_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[A-Za-z0-9-]+",
+    re.I,
+)
+
+# ---------- Runtime state ----------
+settings_cache: dict[int, dict[str, Any]] = {}
+settings_cache_at: dict[int, float] = {}
+SETTINGS_TTL = 10
+
+spam_history: defaultdict[tuple[int, int], deque] = defaultdict(deque)
+duplicate_history: defaultdict[tuple[int, int], deque] = defaultdict(deque)
+violations: defaultdict[tuple[int, int], deque] = defaultdict(deque)
+join_history: defaultdict[int, deque] = defaultdict(deque)
+
+# ---------- Supabase ----------
+def db_headers() -> dict[str, str]:
+    # sb_secret_ keys are API keys, not JWTs. apikey is the correct header.
+    return {
+        "apikey": SUPABASE_KEY,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
 
-def _dashboard_headers():
-    # Supabase's newer sb_secret_ keys are API keys, not JWTs.  Do not send
-    # them as a Bearer token; the apikey header is sufficient.
-    return {"apikey": SUPABASE_SERVICE_ROLE_KEY, "Accept": "application/json"}
+def db_get_sync(guild_id: int) -> dict[str, Any]:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing.")
+    q = urlencode({"guild_id": f"eq.{guild_id}", "select": "settings", "limit": "1"})
+    req = Request(f"{SUPABASE_URL}/rest/v1/guild_settings?{q}", headers=db_headers(), method="GET")
+    with urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return data[0].get("settings") or {} if data else {}
 
 
-def _fetch_guild_settings_sync(guild_id):
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        return {}
-    query = urlencode({"guild_id": f"eq.{guild_id}", "select": "settings", "limit": "1"})
+def db_upsert_sync(guild_id: int, settings: dict[str, Any]) -> dict[str, Any]:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing.")
     req = Request(
-        f"{SUPABASE_URL}/rest/v1/guild_settings?{query}",
-        headers=_dashboard_headers(),
-        method="GET",
+        f"{SUPABASE_URL}/rest/v1/guild_settings",
+        headers={**db_headers(), "Prefer": "resolution=merge-duplicates,return=representation"},
+        data=json.dumps({
+            "guild_id": str(guild_id),
+            "settings": settings,
+            "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }).encode(),
+        method="POST",
     )
-    with urlopen(req, timeout=8) as response:
-        rows = json.loads(response.read().decode("utf-8"))
-    return rows[0].get("settings", {}) if rows else {}
+    with urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return data[0].get("settings", settings) if data else settings
 
 
-async def get_automod_settings(guild_id):
+async def get_settings(guild_id: int, force: bool = False) -> dict[str, Any]:
     now = asyncio.get_running_loop().time()
-    cached = _automod_cache.get(guild_id)
-    if cached is not None and now - _automod_cache_times.get(guild_id, 0) < AUTOMOD_CACHE_TTL:
-        return cached
+    if not force and guild_id in settings_cache and now - settings_cache_at.get(guild_id, 0) < SETTINGS_TTL:
+        return settings_cache[guild_id]
     try:
-        data = await asyncio.to_thread(_fetch_guild_settings_sync, guild_id)
-        settings = dict(AUTOMOD_DEFAULTS)
-        if isinstance(data, dict):
-            settings.update(data)
-        _automod_cache[guild_id] = settings
-        _automod_cache_times[guild_id] = now
-        return settings
-    except Exception as exc:
-        # Keep the bot alive if Supabase is temporarily unavailable.
-        print(f"AutoMod settings load failed for guild {guild_id}: {exc}")
-        if cached is not None:
-            return cached
-        return dict(AUTOMOD_DEFAULTS)
+        raw = await asyncio.to_thread(db_get_sync, guild_id)
+        merged = dict(DEFAULTS)
+        if isinstance(raw, dict):
+            merged.update(raw)
+        settings_cache[guild_id] = merged
+        settings_cache_at[guild_id] = now
+        return merged
+    except Exception as e:
+        print(f"[Supabase] GET guild {guild_id} failed: {e}")
+        if guild_id in settings_cache:
+            return settings_cache[guild_id]
+        return dict(DEFAULTS)
 
 
-def _clean_text(text):
-    return re.sub(r"\s+", " ", text.strip().lower())
+async def save_settings(guild_id: int, changes: dict[str, Any]) -> dict[str, Any]:
+    current = await get_settings(guild_id)
+    current.update(changes)
+    saved = await asyncio.to_thread(db_upsert_sync, guild_id, current)
+    settings_cache[guild_id] = saved
+    settings_cache_at[guild_id] = asyncio.get_running_loop().time()
+    return saved
+
+# ---------- Discord ----------
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-def _contains_bad_word(content, words):
-    lowered = content.casefold()
-    return any(str(word).strip().casefold() in lowered for word in words if str(word).strip())
+def is_staff(member: discord.Member) -> bool:
+    p = member.guild_permissions
+    return p.administrator or p.manage_guild or p.manage_messages
 
 
-async def _send_mod_log(guild, title, description):
-    channel_id = config.get("log_channel_id")
-    if channel_id:
-        channel = guild.get_channel(channel_id)
-        if channel:
-            try:
-                await channel.send(f"**{title}**\n{description}")
-            except discord.HTTPException:
-                pass
+def bypassed(member: discord.Member, settings: dict[str, Any]) -> bool:
+    if member.guild_permissions.administrator or member.guild_permissions.manage_messages:
+        return True
+    bypass_roles = {int(x) for x in settings.get("bypassRoles", []) if str(x).isdigit()}
+    return any(r.id in bypass_roles for r in member.roles)
 
 
-async def _handle_violation(message, reason, settings):
+def ignored(message: discord.Message, settings: dict[str, Any]) -> bool:
+    return message.channel.id in {int(x) for x in settings.get("ignoredChannels", []) if str(x).isdigit()}
+
+
+async def send_log(guild: discord.Guild, title: str, description: str, color: int = 0x5865F2):
+    settings = await get_settings(guild.id)
+    if not settings.get("logging"):
+        return
+    cid = settings.get("logChannelId")
+    if not cid:
+        return
+    channel = guild.get_channel(int(cid))
+    if not channel:
+        return
+    embed = discord.Embed(title=title, description=description, color=color, timestamp=dt.datetime.now(dt.timezone.utc))
     try:
-        await message.delete()
-    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        await channel.send(embed=embed)
+    except discord.HTTPException:
         pass
 
-    member = message.author
-    guild = message.guild
-    key = (guild.id, member.id)
-    # Keep a lightweight violation counter; it resets naturally after 10 min.
-    now = asyncio.get_running_loop().time()
-    history = _spam_history[key]
-    history.append(now)
-    while history and now - history[0] > 600:
-        history.popleft()
 
-    count = len(history)
-    if count in (1, 3, 5):
+async def violation(message: discord.Message, reason: str, settings: dict[str, Any]):
+    guild = message.guild
+    member = message.author
+    try:
+        await message.delete()
+    except discord.HTTPException as e:
+        print(f"[AutoMod] Could not delete message: {e}")
+
+    key = (guild.id, member.id)
+    now = asyncio.get_running_loop().time()
+    h = violations[key]
+    h.append(now)
+    while h and now - h[0] > 600:
+        h.popleft()
+
+    try:
+        await message.channel.send(
+            f"⚠️ {member.mention}, your message was removed: **{reason}**",
+            delete_after=6,
+        )
+    except discord.HTTPException:
+        pass
+
+    timeout_minutes = max(0, int(settings.get("timeoutMinutes", 5) or 0))
+    if len(h) >= 3 and timeout_minutes and guild.me and guild.me.guild_permissions.moderate_members:
         try:
-            await message.channel.send(
-                f"⚠️ {member.mention}, your message was removed: **{reason}**. "
-                f"Violation #{count}.", delete_after=6
-            )
+            await member.timeout(dt.timedelta(minutes=timeout_minutes), reason=f"XModda AutoMod: {reason}")
         except discord.HTTPException:
             pass
 
-    timeout_minutes = max(0, int(settings.get("timeoutMinutes", 5) or 0))
-    if count >= 3 and timeout_minutes > 0 and guild.me and guild.me.guild_permissions.moderate_members:
-        try:
-            await member.timeout(datetime.timedelta(minutes=timeout_minutes), reason=f"XModda AutoMod: {reason}")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    await _send_mod_log(guild, "AutoMod action", f"{member.mention}: {reason} in {message.channel.mention}")
+    await send_log(
+        guild,
+        "AutoMod action",
+        f"**User:** {member.mention}\n**Channel:** {message.channel.mention}\n**Reason:** {reason}",
+        0xED4245,
+    )
 
 
-async def run_automod(message):
+async def automod(message: discord.Message) -> bool:
     if not message.guild or message.author.bot or not message.content:
         return False
-
-    member = message.author
-    # Moderators/admins can test the bot without it deleting their messages.
-    if member.guild_permissions.administrator or member.guild_permissions.manage_messages:
+    settings = await get_settings(message.guild.id)
+    if bypassed(message.author, settings) or ignored(message, settings):
         return False
 
-    settings = await get_automod_settings(message.guild.id)
     content = message.content
     now = asyncio.get_running_loop().time()
-    key = (message.guild.id, member.id)
+    key = (message.guild.id, message.author.id)
+
+    # Invite detection comes before generic links.
+    if settings.get("antiInvites") and INVITE_RE.search(content):
+        await violation(message, "Discord invites are disabled in this server.", settings)
+        return True
 
     if settings.get("antiLinks") and URL_RE.search(content):
-        await _handle_violation(message, "Links are disabled in this server", settings)
+        await violation(message, "Links are disabled in this server.", settings)
         return True
 
-    if settings.get("antiInvites") and INVITE_RE.search(content):
-        await _handle_violation(message, "Discord invites are disabled in this server", settings)
+    words = settings.get("badWordsList") or []
+    if settings.get("badWords") and any(str(w).strip().casefold() in content.casefold() for w in words if str(w).strip()):
+        await violation(message, "A blocked word or phrase was detected.", settings)
         return True
 
-    if settings.get("badWords") and _contains_bad_word(content, settings.get("badWordsList", [])):
-        await _handle_violation(message, "A blocked word or phrase was detected", settings)
-        return True
-
-    min_caps_len = max(1, int(settings.get("capsMinLength", 8) or 8))
-    letters = [c for c in content if c.isalpha()]
-    caps_percent = (sum(c.isupper() for c in letters) / len(letters) * 100) if letters else 0
-    if settings.get("caps") and len(letters) >= min_caps_len and caps_percent >= float(settings.get("capsPercent", 70) or 70):
-        await _handle_violation(message, "Excessive uppercase text is disabled", settings)
-        return True
+    if settings.get("caps"):
+        letters = [c for c in content if c.isalpha()]
+        minimum = max(1, int(settings.get("capsMinLength", 8) or 8))
+        percent = (sum(c.isupper() for c in letters) / len(letters) * 100) if letters else 0
+        if len(letters) >= minimum and percent >= float(settings.get("capsPercent", 70) or 70):
+            await violation(message, "Excessive uppercase text is not allowed.", settings)
+            return True
 
     if settings.get("duplicate"):
-        dup = _duplicate_history[key]
-        normalized = _clean_text(content)
-        dup.append((now, normalized))
-        while dup and now - dup[0][0] > 15:
-            dup.popleft()
-        same_count = sum(1 for _, text in dup if text == normalized)
-        if same_count >= max(2, int(settings.get("duplicateLimit", 3) or 3)):
-            await _handle_violation(message, "Repeated duplicate messages are not allowed", settings)
+        d = duplicate_history[key]
+        normalized = re.sub(r"\s+", " ", content.strip().casefold())
+        d.append((now, normalized))
+        while d and now - d[0][0] > 20:
+            d.popleft()
+        count = sum(1 for _, text in d if text == normalized)
+        if count >= max(2, int(settings.get("duplicateLimit", 3) or 3)):
+            await violation(message, "Repeated duplicate messages are not allowed.", settings)
             return True
 
     if settings.get("antiSpam"):
-        spam = _spam_history[key]
-        spam.append(now)
+        s = spam_history[key]
+        s.append(now)
         window = max(1, int(settings.get("antiSpamWindow", 6) or 6))
         limit = max(2, int(settings.get("antiSpamLimit", 5) or 5))
-        while spam and now - spam[0] > window:
-            spam.popleft()
-        if len(spam) > limit:
-            await _handle_violation(message, f"Too many messages in {window} seconds", settings)
+        while s and now - s[0] > window:
+            s.popleft()
+        if len(s) > limit:
+            await violation(message, f"Too many messages in {window} seconds.", settings)
             return True
 
     return False
 
+# ---------- Events ----------
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"[XModda] Logged in as {bot.user} | synced {len(synced)} slash commands")
+    except Exception as e:
+        print(f"[XModda] Slash sync failed: {e}")
+    print(f"[XModda] Connected to {len(bot.guilds)} guild(s)")
+    print(f"[XModda] Supabase configured: {bool(SUPABASE_URL and SUPABASE_KEY)}")
+
 
 @bot.event
-async def on_message(message):
-    if not message.author.bot:
-        await run_automod(message)
+async def on_message(message: discord.Message):
+    if message.guild and not message.author.bot:
+        await automod(message)
     await bot.process_commands(message)
 
 
 @bot.event
-async def on_member_join(member):
-    if not member.guild:
-        return
-    settings = await get_automod_settings(member.guild.id)
-    if not settings.get("raid"):
-        return
-    now = asyncio.get_running_loop().time()
-    joins = _join_history[member.guild.id]
-    joins.append(now)
-    window = max(1, int(settings.get("raidWindow", 10) or 10))
-    limit = max(2, int(settings.get("raidJoinLimit", 8) or 8))
-    while joins and now - joins[0] > window:
-        joins.popleft()
-    if len(joins) == limit:
-        channel = member.guild.system_channel
+async def on_member_join(member: discord.Member):
+    settings = await get_settings(member.guild.id)
+
+    # Welcome
+    if settings.get("welcome") and settings.get("welcomeChannelId"):
+        channel = member.guild.get_channel(int(settings["welcomeChannelId"]))
         if channel:
+            text = str(settings.get("welcomeMessage") or DEFAULTS["welcomeMessage"])
+            text = text.replace("{user}", member.mention).replace("{username}", member.name)
+            text = text.replace("{server}", member.guild.name).replace("{count}", str(member.guild.member_count or 0))
             try:
-                await channel.send(f"🚨 **Raid Protection:** {len(joins)} members joined within {window} seconds.")
+                await channel.send(text)
             except discord.HTTPException:
                 pass
-        await _send_mod_log(member.guild, "Raid Protection", f"Detected {len(joins)} joins in {window} seconds.")
 
-# --- Persistent Views ---
-class CreateTicketView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+    # Auto role
+    if settings.get("autoRole") and settings.get("autoRoleId"):
+        role = member.guild.get_role(int(settings["autoRoleId"]))
+        if role and member.guild.me and role < member.guild.me.top_role:
+            try:
+                await member.add_roles(role, reason="XModda auto-role")
+            except discord.HTTPException:
+                pass
 
-    @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket")
-    async def create_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await create_ticket(interaction)
+    # Raid detection
+    if settings.get("raid"):
+        now = asyncio.get_running_loop().time()
+        joins = join_history[member.guild.id]
+        joins.append(now)
+        window = max(1, int(settings.get("raidWindow", 10) or 10))
+        limit = max(2, int(settings.get("raidJoinLimit", 8) or 8))
+        while joins and now - joins[0] > window:
+            joins.popleft()
+        if len(joins) >= limit:
+            await send_log(member.guild, "🚨 Possible raid detected", f"{len(joins)} members joined within {window} seconds.", 0xED4245)
 
-class TicketManageView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+# ---------- Error helper ----------
+def ok_embed(title: str, description: str) -> discord.Embed:
+    return discord.Embed(title=title, description=description, color=0x57F287)
 
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="claim_ticket")
-    async def claim_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await claim_ticket(interaction)
 
-    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="close_ticket")
-    async def close_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await close_ticket(interaction)
+def err_embed(text: str) -> discord.Embed:
+    return discord.Embed(title="XModda", description=f"❌ {text}", color=0xED4245)
 
-async def create_ticket(interaction: discord.Interaction):
-    guild = interaction.guild
-    member = interaction.user
+# ---------- General ----------
+@bot.tree.command(name="ping", description="Check XModda latency")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message(f"🏓 Pong! `{round(bot.latency * 1000)}ms`", ephemeral=True)
 
-    category_id = config.get("ticket_category_id")
-    staff_role_id = config.get("staff_role_id")
-    if category_id is None or staff_role_id is None:
-        await interaction.response.send_message("Ticket category or staff role not set. Admins must use `/ticket_config` first.", ephemeral=True)
-        return
 
-    category = guild.get_channel(category_id)
-    staff_role = guild.get_role(staff_role_id)
-    if category is None or staff_role is None:
-        await interaction.response.send_message("Configured category or role no longer exists. Please update with `/ticket_config`.", ephemeral=True)
-        return
-
-    limit = config.get("ticket_limit", 1)
-    open_tickets = [ch for ch in guild.text_channels if ch.name.startswith(f'ticket-{member.name.lower()}') and ch.category_id == category_id]
-    if len(open_tickets) >= limit:
-        await interaction.response.send_message(f"You already have {limit} open ticket(s). Please close existing ones before creating a new one.", ephemeral=True)
-        return
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-        staff_role: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-    }
-
-    ticket_channel = await guild.create_text_channel(
-        name=f'ticket-{member.name.lower()}',
-        category=category,
-        overwrites=overwrites
-    )
-
-    embed = discord.Embed(
-        title=config.get("opened_embed_title", "Ticket Created"),
-        description=config.get("opened_embed_description", "Welcome {user}!").replace("{user}", member.mention),
-        color=config.get("opened_embed_color", 0x0000ff),
-        timestamp=datetime.datetime.utcnow()
-    )
-    embed.set_footer(text=f"Ticket ID: {ticket_channel.id}")
-    thumbnail = config.get("opened_embed_thumbnail")
-    if thumbnail:
-        embed.set_thumbnail(url=thumbnail)
-
-    view = TicketManageView()
-    await ticket_channel.send(embed=embed, view=view)
-
-    log_channel_id = config.get("log_channel_id")
-    if log_channel_id:
-        log_channel = guild.get_channel(log_channel_id)
-        if log_channel:
-            await log_channel.send(f"Ticket {ticket_channel.mention} created by {member.mention}")
-
-    await interaction.response.send_message(f"Ticket created: {ticket_channel.mention}", ephemeral=True)
-
-async def claim_ticket(interaction: discord.Interaction):
-    staff_role_id = config.get("staff_role_id")
-    if staff_role_id is None:
-        await interaction.response.send_message("Staff role not set.", ephemeral=True)
-        return
-    staff_role = interaction.guild.get_role(staff_role_id)
-    if staff_role is None or staff_role not in interaction.user.roles:
-        await interaction.response.send_message("You are not staff.", ephemeral=True)
-        return
-
-    channel = interaction.channel
-    if not channel.name.startswith('ticket-'):
-        await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
-        return
-
-    overwrite = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-    await channel.set_permissions(interaction.user, overwrite=overwrite)
-
-    async for msg in channel.history(limit=10, oldest_first=True):
-        if msg.author == bot.user and msg.embeds:
-            embed = msg.embeds[0]
-            embed.add_field(name="Claimed by", value=interaction.user.mention, inline=False)
-            await msg.edit(embed=embed)
-            break
-
-    await interaction.response.send_message("You have claimed this ticket.", ephemeral=True)
-
-async def close_ticket(interaction: discord.Interaction):
-    countdown_msg = await interaction.channel.send("Closing ticket in 5 seconds...")
-    for i in range(5, 0, -1):
-        await asyncio.sleep(1)
-        await countdown_msg.edit(content=f"Closing ticket in {i} seconds...")
-
-    await save_transcript(interaction.channel, interaction.guild)
-    await interaction.channel.delete()
-
-async def save_transcript(channel, guild):
-    transcript_lines = []
-    async for message in channel.history(limit=1000, oldest_first=True):
-        timestamp = message.created_at.strftime("%Y-%m-%d %H:%M:%S")
-        author = f"{message.author.name}#{message.author.discriminator}"
-        content = message.content if message.content else "[Embed/Attachment]"
-        transcript_lines.append(f"[{timestamp}] {author}: {content}")
-
-    html_content = "<html><head><title>Ticket Transcript</title></head><body>"
-    html_content += "<h1>Ticket Transcript</h1><pre>"
-    html_content += "\n".join(transcript_lines)
-    html_content += "</pre></body></html>"
-
-    filename = f"transcript-{channel.name}.html"
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    log_channel_id = config.get("log_channel_id")
-    if log_channel_id:
-        log_channel = guild.get_channel(log_channel_id)
-        if log_channel:
-            await log_channel.send(f"Transcript for `{channel.name}`:", file=discord.File(filename))
-
-    if os.path.exists(filename):
-        os.remove(filename)
-
-# --- Bot Events ---
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
-    threading.Thread(target=run_web_server, daemon=True).start()
-    print('Web server started for UptimeRobot')
-
-    bot.add_view(CreateTicketView())
-    bot.add_view(TicketManageView())
-
-    try:
-        synced = await bot.tree.sync()
-        print(f'Synced {len(synced)} commands')
-    except Exception as e:
-        print(f'Failed to sync commands: {e}')
-
-    print('Bot is ready.')
-
-# --- Prefix sync command ---
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def sync(ctx):
-    try:
-        await bot.tree.sync()
-        await ctx.send("Slash commands synced globally.")
-    except Exception as e:
-        await ctx.send(f"Sync failed: {e}")
-
-# --- Ticket Config Dropdown Command ---
-@bot.tree.command(name="ticket_config", description="Open ticket configuration panel (Admin only)")
-@app_commands.checks.has_permissions(administrator=True)
-async def ticket_config(interaction: discord.Interaction):
-    view = ConfigMainView()
-    await interaction.response.send_message("Select an option to configure:", view=view, ephemeral=True)
-
-class ConfigMainView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=180)
-        self.add_item(ConfigMainSelect())
-
-class ConfigMainSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label="View Current Config", description="Show current settings", emoji="📋"),
-            discord.SelectOption(label="Set Category", description="Set the category for new tickets", emoji="📁"),
-            discord.SelectOption(label="Set Staff Role", description="Set the role that can see tickets", emoji="👥"),
-            discord.SelectOption(label="Set Log Channel", description="Set the channel for logs/transcripts", emoji="📜"),
-            discord.SelectOption(label="Set Ticket Limit", description="Max tickets per user", emoji="🔢"),
-            discord.SelectOption(label="Edit Panel Embed", description="Edit the ticket panel embed", emoji="🎨"),
-            discord.SelectOption(label="Edit Opened Embed", description="Edit the opened ticket embed", emoji="🎫"),
-            discord.SelectOption(label="Post Ticket Panel", description="Post the ticket panel in this channel", emoji="📬")
-        ]
-        super().__init__(placeholder="Choose an option...", min_values=1, max_values=1, options=options)
-
-    async def callback(self, interaction: discord.Interaction):
-        selected = self.values[0]
-        if selected == "View Current Config":
-            embed = discord.Embed(title="Current Ticket Configuration", color=0x00ff00)
-            embed.add_field(name="Category", value=f"<#{config.get('ticket_category_id')}>" if config.get('ticket_category_id') else "Not set", inline=False)
-            embed.add_field(name="Staff Role", value=f"<@&{config.get('staff_role_id')}>" if config.get('staff_role_id') else "Not set", inline=False)
-            embed.add_field(name="Log Channel", value=f"<#{config.get('log_channel_id')}>" if config.get('log_channel_id') else "Not set", inline=False)
-            embed.add_field(name="Ticket Limit", value=config.get('ticket_limit', 1), inline=False)
-            embed.add_field(name="Panel Embed Title", value=config.get('panel_embed_title', 'Support Tickets'), inline=False)
-            embed.add_field(name="Panel Embed Description", value=config.get('panel_embed_description', 'Click the button below to open a support ticket.'), inline=False)
-            embed.add_field(name="Opened Embed Title", value=config.get('opened_embed_title', 'Ticket Created'), inline=False)
-            embed.add_field(name="Opened Embed Description", value=config.get('opened_embed_description', 'Welcome {user}!'), inline=False)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-        elif selected == "Set Category":
-            categories = interaction.guild.categories
-            if not categories:
-                await interaction.response.send_message("No categories found.", ephemeral=True)
-                return
-            options = [discord.SelectOption(label=cat.name, value=str(cat.id)) for cat in categories[:25]]
-            view = discord.ui.View(timeout=60)
-            select = discord.ui.Select(placeholder="Select a category...", options=options)
-            async def category_callback(interaction: discord.Interaction):
-                cat_id = int(select.values[0])
-                config["ticket_category_id"] = cat_id
-                save_config()
-                cat = interaction.guild.get_channel(cat_id)
-                await interaction.response.send_message(f"Ticket category set to {cat.mention}", ephemeral=True)
-            select.callback = category_callback
-            view.add_item(select)
-            await interaction.response.send_message("Select a category:", view=view, ephemeral=True)
-        elif selected == "Set Staff Role":
-            roles = [r for r in interaction.guild.roles if r.name != "@everyone"]
-            options = [discord.SelectOption(label=role.name, value=str(role.id)) for role in roles[:25]]
-            if not options:
-                await interaction.response.send_message("No roles available.", ephemeral=True)
-                return
-            view = discord.ui.View(timeout=60)
-            select = discord.ui.Select(placeholder="Select a role...", options=options)
-            async def role_callback(interaction: discord.Interaction):
-                role_id = int(select.values[0])
-                config["staff_role_id"] = role_id
-                save_config()
-                role = interaction.guild.get_role(role_id)
-                await interaction.response.send_message(f"Staff role set to {role.mention}", ephemeral=True)
-            select.callback = role_callback
-            view.add_item(select)
-            await interaction.response.send_message("Select a role:", view=view, ephemeral=True)
-        elif selected == "Set Log Channel":
-            text_channels = [ch for ch in interaction.guild.channels if isinstance(ch, discord.TextChannel)]
-            options = [discord.SelectOption(label=ch.name, value=str(ch.id)) for ch in text_channels[:25]]
-            if not options:
-                await interaction.response.send_message("No text channels found.", ephemeral=True)
-                return
-            view = discord.ui.View(timeout=60)
-            select = discord.ui.Select(placeholder="Select a log channel...", options=options)
-            async def log_callback(interaction: discord.Interaction):
-                ch_id = int(select.values[0])
-                config["log_channel_id"] = ch_id
-                save_config()
-                ch = interaction.guild.get_channel(ch_id)
-                await interaction.response.send_message(f"Log channel set to {ch.mention}", ephemeral=True)
-            select.callback = log_callback
-            view.add_item(select)
-            await interaction.response.send_message("Select a log channel:", view=view, ephemeral=True)
-        elif selected == "Set Ticket Limit":
-            modal = LimitModal()
-            await interaction.response.send_modal(modal)
-        elif selected == "Edit Panel Embed":
-            modal = EmbedEditModal(
-                title="Edit Panel Embed",
-                current_title=config.get("panel_embed_title", ""),
-                current_description=config.get("panel_embed_description", ""),
-                current_color=hex(config.get("panel_embed_color", 0x00ff00)),
-                current_thumbnail=config.get("panel_embed_thumbnail"),
-                embed_type="panel"
-            )
-            await interaction.response.send_modal(modal)
-        elif selected == "Edit Opened Embed":
-            modal = EmbedEditModal(
-                title="Edit Opened Ticket Embed",
-                current_title=config.get("opened_embed_title", ""),
-                current_description=config.get("opened_embed_description", ""),
-                current_color=hex(config.get("opened_embed_color", 0x0000ff)),
-                current_thumbnail=config.get("opened_embed_thumbnail"),
-                embed_type="opened"
-            )
-            await interaction.response.send_modal(modal)
-        elif selected == "Post Ticket Panel":
-            embed = discord.Embed(
-                title=config.get("panel_embed_title", "Support Tickets"),
-                description=config.get("panel_embed_description", "Click the button below to open a support ticket."),
-                color=config.get("panel_embed_color", 0x00ff00)
-            )
-            if config.get("panel_embed_thumbnail"):
-                embed.set_thumbnail(url=config["panel_embed_thumbnail"])
-            embed.set_footer(text="Powered by SOMBRA")
-            view = CreateTicketView()
-            await interaction.channel.send(embed=embed, view=view)
-            await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
-
-# --- Modal for ticket limit ---
-class LimitModal(discord.ui.Modal):
-    def __init__(self):
-        super().__init__(title="Set Ticket Limit")
-        self.add_item(discord.ui.TextInput(label="Limit", placeholder="Enter max tickets per user (1-10)", default=str(config.get('ticket_limit', 1)), max_length=2))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            limit = int(self.children[0].value)
-            if 1 <= limit <= 10:
-                config["ticket_limit"] = limit
-                save_config()
-                await interaction.response.send_message(f"Ticket limit set to {limit}.", ephemeral=True)
-            else:
-                await interaction.response.send_message("Limit must be between 1 and 10.", ephemeral=True)
-        except ValueError:
-            await interaction.response.send_message("Invalid number.", ephemeral=True)
-
-# --- Modal for editing embeds (with thumbnail) ---
-class EmbedEditModal(discord.ui.Modal):
-    def __init__(self, title, current_title, current_description, current_color, current_thumbnail, embed_type):
-        super().__init__(title=title)
-        self.embed_type = embed_type
-        self.add_item(discord.ui.TextInput(label="Embed Title", placeholder="Enter title", default=current_title, required=False, max_length=256))
-        self.add_item(discord.ui.TextInput(label="Embed Description", placeholder="Enter description (use {user} for mention in opened ticket)", default=current_description, style=discord.TextStyle.paragraph, required=False, max_length=4000))
-        self.add_item(discord.ui.TextInput(label="Embed Color (hex)", placeholder="e.g., #00ff00", default=current_color, required=False, max_length=7))
-        self.add_item(discord.ui.TextInput(label="Thumbnail URL", placeholder="Optional image URL", default=current_thumbnail or "", required=False, max_length=500))
-
-    async def on_submit(self, interaction: discord.Interaction):
-        title_val = self.children[0].value.strip()
-        desc_val = self.children[1].value.strip()
-        color_val = self.children[2].value.strip()
-        thumb_val = self.children[3].value.strip()
-
-        try:
-            color_int = int(color_val.lstrip('#'), 16) if color_val else None
-        except ValueError:
-            color_int = None
-            await interaction.response.send_message("Invalid color hex. Using default.", ephemeral=True)
-
-        if self.embed_type == "panel":
-            config["panel_embed_title"] = title_val
-            config["panel_embed_description"] = desc_val
-            if color_int is not None:
-                config["panel_embed_color"] = color_int
-            if thumb_val:
-                config["panel_embed_thumbnail"] = thumb_val
-            else:
-                config["panel_embed_thumbnail"] = None
-        elif self.embed_type == "opened":
-            config["opened_embed_title"] = title_val
-            config["opened_embed_description"] = desc_val
-            if color_int is not None:
-                config["opened_embed_color"] = color_int
-            if thumb_val:
-                config["opened_embed_thumbnail"] = thumb_val
-            else:
-                config["opened_embed_thumbnail"] = None
-
-        save_config()
-        await interaction.response.send_message("Embed configuration updated.", ephemeral=True)
-
-# --- Non-ticket slash commands (moderation & utility) ---
-@bot.tree.command(name="userinfo", description="Get information about a user")
-async def userinfo(interaction: discord.Interaction, user: discord.User = None):
-    user = user or interaction.user
-    member = interaction.guild.get_member(user.id)
-    embed = discord.Embed(title=f"User Info: {user}", color=0x3498db)
-    embed.set_thumbnail(url=user.avatar.url if user.avatar else user.default_avatar.url)
-    embed.add_field(name="ID", value=user.id, inline=True)
-    embed.add_field(name="Bot?", value=user.bot, inline=True)
-    if member:
-        embed.add_field(name="Nickname", value=member.nick or "None", inline=True)
-        embed.add_field(name="Joined Server", value=member.joined_at.strftime("%Y-%m-%d %H:%M") if member.joined_at else "N/A", inline=True)
-        embed.add_field(name="Roles", value=", ".join([r.mention for r in member.roles[1:]]) or "None", inline=False)
-    embed.add_field(name="Account Created", value=user.created_at.strftime("%Y-%m-%d %H:%M"), inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="serverinfo", description="Get information about the server")
+@bot.tree.command(name="serverinfo", description="Show server information")
 async def serverinfo(interaction: discord.Interaction):
-    guild = interaction.guild
-    embed = discord.Embed(title=guild.name, color=0x9b59b6)
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-    embed.add_field(name="Owner", value=guild.owner.mention, inline=True)
-    embed.add_field(name="Members", value=guild.member_count, inline=True)
-    embed.add_field(name="Channels", value=len(guild.channels), inline=True)
-    embed.add_field(name="Roles", value=len(guild.roles), inline=True)
-    embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d"), inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    g = interaction.guild
+    e = discord.Embed(title=g.name, color=0x5865F2)
+    e.add_field(name="Members", value=str(g.member_count))
+    e.add_field(name="Channels", value=str(len(g.channels)))
+    e.add_field(name="Owner", value=f"<@{g.owner_id}>")
+    await interaction.response.send_message(embed=e)
 
-@bot.tree.command(name="avatar", description="Get avatar of a user")
-async def avatar(interaction: discord.Interaction, user: discord.User = None):
-    user = user or interaction.user
-    embed = discord.Embed(title=f"{user}'s Avatar", color=0xe67e22)
-    embed.set_image(url=user.avatar.url if user.avatar else user.default_avatar.url)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# --- Moderation commands with DM and public embeds ---
-async def send_dm_embed(member: discord.Member, action: str, reason: str, guild_name: str):
-    """Attempt to send a DM embed to the member before action."""
-    embed = discord.Embed(
-        title=f"You have been {action}",
-        description=f"**Server:** {guild_name}\n**Reason:** {reason}",
-        color=0xff0000,
-        timestamp=datetime.datetime.utcnow()
-    )
-    embed.set_footer(text="This action was performed by a moderator.")
-    try:
-        await member.send(embed=embed)
-        return True
-    except (discord.Forbidden, discord.HTTPException):
-        return False
+@bot.tree.command(name="userinfo", description="Show information about a member")
+@app_commands.describe(member="Member to inspect")
+async def userinfo(interaction: discord.Interaction, member: discord.Member):
+    e = discord.Embed(title=f"User Info — {member}", color=member.color.value or 0x5865F2)
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="ID", value=str(member.id), inline=False)
+    e.add_field(name="Joined", value=discord.utils.format_dt(member.joined_at, "R") if member.joined_at else "Unknown")
+    await interaction.response.send_message(embed=e)
+
+
+@bot.tree.command(name="avatar", description="Show a member's avatar")
+@app_commands.describe(member="Member")
+async def avatar(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    member = member or interaction.user
+    e = discord.Embed(title=f"{member.display_name}'s Avatar", color=0x5865F2)
+    e.set_image(url=member.display_avatar.url)
+    await interaction.response.send_message(embed=e)
+
+# ---------- Moderation ----------
+@bot.tree.command(name="purge", description="Delete messages")
+@app_commands.describe(amount="Number of messages to delete (1-100)")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def purge(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
+    deleted = await interaction.channel.purge(limit=amount)
+    await interaction.response.send_message(f"🗑️ Deleted {len(deleted)} messages.", ephemeral=True)
+    await send_log(interaction.guild, "Messages purged", f"{interaction.user.mention} deleted {len(deleted)} messages in {interaction.channel.mention}")
+
 
 @bot.tree.command(name="kick", description="Kick a member")
+@app_commands.describe(member="Member", reason="Reason")
 @app_commands.checks.has_permissions(kick_members=True)
-async def kick(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    if user.top_role >= interaction.user.top_role:
-        await interaction.response.send_message("You cannot kick a member with equal or higher role.", ephemeral=True)
-        return
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.top_role >= interaction.user.top_role:
+        return await interaction.response.send_message(embed=err_embed("You cannot kick this member."), ephemeral=True)
+    await member.kick(reason=reason)
+    await interaction.response.send_message(f"👢 Kicked **{member}**.")
+    await send_log(interaction.guild, "Member kicked", f"**Member:** {member}\n**By:** {interaction.user.mention}\n**Reason:** {reason}", 0xED4245)
 
-    dm_sent = await send_dm_embed(user, "kicked", reason, interaction.guild.name)
-
-    try:
-        await user.kick(reason=reason)
-    except Exception as e:
-        await interaction.response.send_message(f"Failed to kick: {e}", ephemeral=True)
-        return
-
-    confirm_embed = discord.Embed(
-        title="Member Kicked",
-        description=f"{user.mention} has been kicked.",
-        color=0xff0000,
-        timestamp=datetime.datetime.utcnow()
-    )
-    confirm_embed.add_field(name="Reason", value=reason, inline=False)
-    confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
-    confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
-    await interaction.response.send_message(embed=confirm_embed)  # public
 
 @bot.tree.command(name="ban", description="Ban a member")
+@app_commands.describe(member="Member", reason="Reason")
 @app_commands.checks.has_permissions(ban_members=True)
-async def ban(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    if user.top_role >= interaction.user.top_role:
-        await interaction.response.send_message("You cannot ban a member with equal or higher role.", ephemeral=True)
-        return
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    if member.top_role >= interaction.user.top_role:
+        return await interaction.response.send_message(embed=err_embed("You cannot ban this member."), ephemeral=True)
+    await member.ban(reason=reason)
+    await interaction.response.send_message(f"🔨 Banned **{member}**.")
+    await send_log(interaction.guild, "Member banned", f"**Member:** {member}\n**By:** {interaction.user.mention}\n**Reason:** {reason}", 0xED4245)
 
-    dm_sent = await send_dm_embed(user, "banned", reason, interaction.guild.name)
-
-    try:
-        await user.ban(reason=reason)
-    except Exception as e:
-        await interaction.response.send_message(f"Failed to ban: {e}", ephemeral=True)
-        return
-
-    confirm_embed = discord.Embed(
-        title="Member Banned",
-        description=f"{user.mention} has been banned.",
-        color=0xff0000,
-        timestamp=datetime.datetime.utcnow()
-    )
-    confirm_embed.add_field(name="Reason", value=reason, inline=False)
-    confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
-    confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
-    await interaction.response.send_message(embed=confirm_embed)  # public
 
 @bot.tree.command(name="timeout", description="Timeout a member")
+@app_commands.describe(member="Member", minutes="Duration in minutes", reason="Reason")
 @app_commands.checks.has_permissions(moderate_members=True)
-async def timeout(interaction: discord.Interaction, user: discord.Member, minutes: int, reason: str = "No reason provided"):
-    if user.top_role >= interaction.user.top_role:
-        await interaction.response.send_message("You cannot timeout a member with equal or higher role.", ephemeral=True)
-        return
+async def timeout(interaction: discord.Interaction, member: discord.Member, minutes: app_commands.Range[int, 1, 40320], reason: str = "No reason provided"):
+    await member.timeout(dt.timedelta(minutes=minutes), reason=reason)
+    await interaction.response.send_message(f"⏱️ Timed out **{member}** for `{minutes}` minutes.")
+    await send_log(interaction.guild, "Member timed out", f"**Member:** {member}\n**By:** {interaction.user.mention}\n**Duration:** {minutes}m\n**Reason:** {reason}", 0xED4245)
 
-    dm_sent = await send_dm_embed(user, "timed out", reason, interaction.guild.name)
-
-    duration = datetime.timedelta(minutes=minutes)
-    try:
-        await user.timeout(duration, reason=reason)
-    except Exception as e:
-        await interaction.response.send_message(f"Failed to timeout: {e}", ephemeral=True)
-        return
-
-    confirm_embed = discord.Embed(
-        title="Member Timed Out",
-        description=f"{user.mention} has been timed out for {minutes} minutes.",
-        color=0xff0000,
-        timestamp=datetime.datetime.utcnow()
-    )
-    confirm_embed.add_field(name="Reason", value=reason, inline=False)
-    confirm_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
-    confirm_embed.set_footer(text=f"Moderator: {interaction.user}")
-    await interaction.response.send_message(embed=confirm_embed)  # public
-
-@bot.tree.command(name="purge", description="Delete messages")
-@app_commands.checks.has_permissions(manage_messages=True)
-async def purge(interaction: discord.Interaction, amount: int):
-    if amount < 1 or amount > 100:
-        await interaction.response.send_message("Amount must be between 1 and 100.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    deleted = await interaction.channel.purge(limit=amount)
-    await interaction.followup.send(f"Deleted {len(deleted)} messages.", ephemeral=True)
 
 @bot.tree.command(name="warn", description="Warn a member")
+@app_commands.describe(member="Member", reason="Reason")
 @app_commands.checks.has_permissions(manage_messages=True)
-async def warn(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
-    # Attempt to DM the user
-    dm_sent = await send_dm_embed(user, "warned", reason, interaction.guild.name)
+async def warn(interaction: discord.Interaction, member: discord.Member, reason: str = "No reason provided"):
+    key = f"warnings_{interaction.guild.id}"
+    # Keep warning records inside the same JSON settings row.
+    settings = await get_settings(interaction.guild.id)
+    warning_map = settings.get(key, {})
+    uid = str(member.id)
+    warning_map[uid] = int(warning_map.get(uid, 0)) + 1
+    await save_settings(interaction.guild.id, {key: warning_map})
+    await interaction.response.send_message(f"⚠️ Warned **{member}**. Warnings: `{warning_map[uid]}`")
+    await send_log(interaction.guild, "Member warned", f"**Member:** {member}\n**By:** {interaction.user.mention}\n**Reason:** {reason}", 0xFEE75C)
 
-    # Save warning
-    user_id = str(user.id)
-    if user_id not in warnings:
-        warnings[user_id] = []
-    warnings[user_id].append({
-        "reason": reason,
-        "warned_by": interaction.user.id,
-        "timestamp": datetime.datetime.utcnow().isoformat()
-    })
-    save_warnings()
 
-    # Public confirmation embed
-    warn_embed = discord.Embed(
-        title="Member Warned",
-        description=f"{user.mention} has been warned.",
-        color=0xffa500,
-        timestamp=datetime.datetime.utcnow()
+@bot.tree.command(name="warnings", description="View a member's warning count")
+@app_commands.describe(member="Member")
+async def warnings_cmd(interaction: discord.Interaction, member: discord.Member):
+    settings = await get_settings(interaction.guild.id)
+    warning_map = settings.get(f"warnings_{interaction.guild.id}", {})
+    await interaction.response.send_message(f"⚠️ **{member}** has `{warning_map.get(str(member.id), 0)}` warning(s).", ephemeral=True)
+
+# ---------- AutoMod commands ----------
+@bot.tree.command(name="automod_status", description="Show the live AutoMod settings XModda is using")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def automod_status(interaction: discord.Interaction):
+    s = await get_settings(interaction.guild.id, force=True)
+    e = discord.Embed(title="XModda AutoMod Status", color=0x5865F2)
+    for key, label in [
+        ("antiLinks", "Anti-Links"), ("antiInvites", "Anti-Invites"), ("antiSpam", "Anti-Spam"),
+        ("duplicate", "Duplicate"), ("caps", "Excessive Caps"), ("badWords", "Bad Words"), ("raid", "Raid Protection")
+    ]:
+        e.add_field(name=label, value="🟢 ON" if s.get(key) else "🔴 OFF", inline=True)
+    e.add_field(name="Spam", value=f"{s['antiSpamLimit']} msgs / {s['antiSpamWindow']}s", inline=True)
+    e.add_field(name="Duplicate", value=f"{s['duplicateLimit']} repeats", inline=True)
+    e.add_field(name="Caps", value=f"{s['capsPercent']}% / {s['capsMinLength']} letters", inline=True)
+    e.add_field(name="Timeout", value=f"{s['timeoutMinutes']} minutes after repeated violations", inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="automod_reload", description="Immediately reload this server's dashboard settings")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def automod_reload(interaction: discord.Interaction):
+    s = await get_settings(interaction.guild.id, force=True)
+    await interaction.response.send_message(
+        f"🔄 Settings reloaded. Anti-Links: **{'ON' if s.get('antiLinks') else 'OFF'}**, "
+        f"Anti-Spam: **{'ON' if s.get('antiSpam') else 'OFF'}**.", ephemeral=True
     )
-    warn_embed.add_field(name="Reason", value=reason, inline=False)
-    warn_embed.add_field(name="Warning Count", value=len(warnings[user_id]), inline=False)
-    warn_embed.add_field(name="DM Sent", value="Yes" if dm_sent else "No (DMs closed or error)", inline=False)
-    warn_embed.set_footer(text=f"Moderator: {interaction.user}")
 
-    await interaction.response.send_message(embed=warn_embed)  # public
+# ---------- Settings commands ----------
+@bot.tree.command(name="welcome_config", description="Configure welcome messages")
+@app_commands.describe(channel="Welcome channel", message="Message; use {user}, {username}, {server}, {count}")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_config(interaction: discord.Interaction, channel: discord.TextChannel, message: str = DEFAULTS["welcomeMessage"]):
+    await save_settings(interaction.guild.id, {"welcome": True, "welcomeChannelId": channel.id, "welcomeMessage": message})
+    await interaction.response.send_message(embed=ok_embed("Welcome enabled", f"Channel: {channel.mention}\nMessage: {message}"), ephemeral=True)
 
-@bot.tree.command(name="warnings", description="View warnings for a user")
-async def warnings_cmd(interaction: discord.Interaction, user: discord.Member):
-    user_id = str(user.id)
-    if user_id not in warnings or not warnings[user_id]:
-        await interaction.response.send_message(f"{user.mention} has no warnings.", ephemeral=True)
-        return
-    embed = discord.Embed(title=f"Warnings for {user}", color=0xff0000)
-    for i, warn in enumerate(warnings[user_id], 1):
-        warner = interaction.guild.get_member(warn["warned_by"])
-        embed.add_field(name=f"Warning {i}", value=f"Reason: {warn['reason']}\nWarned by: {warner.mention if warner else 'Unknown'}\nTime: {warn['timestamp']}", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="clearwarnings", description="Clear all warnings for a user")
-@app_commands.checks.has_permissions(administrator=True)
-async def clearwarnings(interaction: discord.Interaction, user: discord.Member):
-    user_id = str(user.id)
-    if user_id in warnings:
-        del warnings[user_id]
-        save_warnings()
-    await interaction.response.send_message(f"Cleared all warnings for {user.mention}.", ephemeral=True)
+@bot.tree.command(name="welcome_disable", description="Disable welcome messages")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def welcome_disable(interaction: discord.Interaction):
+    await save_settings(interaction.guild.id, {"welcome": False})
+    await interaction.response.send_message("✅ Welcome messages disabled.", ephemeral=True)
 
-# Run bot
-bot.run(os.environ['DISCORD_TOKEN'])
+
+@bot.tree.command(name="autorole", description="Set the role automatically given to new members")
+@app_commands.describe(role="Role to give")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def autorole(interaction: discord.Interaction, role: discord.Role):
+    if interaction.guild.me and role >= interaction.guild.me.top_role:
+        return await interaction.response.send_message(embed=err_embed("That role must be below XModda's highest role."), ephemeral=True)
+    await save_settings(interaction.guild.id, {"autoRole": True, "autoRoleId": role.id})
+    await interaction.response.send_message(f"✅ Auto-role enabled: {role.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="autorole_disable", description="Disable automatic roles")
+@app_commands.checks.has_permissions(manage_roles=True)
+async def autorole_disable(interaction: discord.Interaction):
+    await save_settings(interaction.guild.id, {"autoRole": False})
+    await interaction.response.send_message("✅ Auto-role disabled.", ephemeral=True)
+
+
+@bot.tree.command(name="logging_config", description="Set the moderation log channel")
+@app_commands.describe(channel="Log channel")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def logging_config(interaction: discord.Interaction, channel: discord.TextChannel):
+    await save_settings(interaction.guild.id, {"logging": True, "logChannelId": channel.id})
+    await interaction.response.send_message(f"✅ Logging enabled in {channel.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="logging_disable", description="Disable logging")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def logging_disable(interaction: discord.Interaction):
+    await save_settings(interaction.guild.id, {"logging": False})
+    await interaction.response.send_message("✅ Logging disabled.", ephemeral=True)
+
+
+@bot.tree.command(name="automod_word", description="Add a word/phrase to the blocked-word list")
+@app_commands.describe(word="Word or phrase")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def automod_word(interaction: discord.Interaction, word: str):
+    s = await get_settings(interaction.guild.id)
+    words = [str(x) for x in (s.get("badWordsList") or [])]
+    if word.casefold() not in [x.casefold() for x in words]:
+        words.append(word)
+    await save_settings(interaction.guild.id, {"badWords": True, "badWordsList": words})
+    await interaction.response.send_message(f"✅ Added `{word}` to the blocked-word list.", ephemeral=True)
+
+
+@bot.tree.command(name="automod_word_remove", description="Remove a word/phrase from the blocked-word list")
+@app_commands.describe(word="Word or phrase")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def automod_word_remove(interaction: discord.Interaction, word: str):
+    s = await get_settings(interaction.guild.id)
+    words = [x for x in (s.get("badWordsList") or []) if str(x).casefold() != word.casefold()]
+    await save_settings(interaction.guild.id, {"badWordsList": words})
+    await interaction.response.send_message(f"✅ Removed `{word}` if it existed.", ephemeral=True)
+
+# ---------- Tickets ----------
+class TicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.primary, emoji="🎫", custom_id="xmodda:ticket_open")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        s = await get_settings(guild.id)
+        category = guild.get_channel(int(s["ticketCategoryId"])) if s.get("ticketCategoryId") else None
+        staff_role = guild.get_role(int(s["ticketStaffRoleId"])) if s.get("ticketStaffRoleId") else None
+        if not isinstance(category, discord.CategoryChannel):
+            return await interaction.response.send_message("❌ Tickets are not configured. An admin must set the category first.", ephemeral=True)
+
+        existing = [c for c in category.channels if isinstance(c, discord.TextChannel) and c.topic == f"xmodda-ticket:{interaction.user.id}"]
+        if existing:
+            return await interaction.response.send_message(f"You already have a ticket: {existing[0].mention}", ephemeral=True)
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True),
+        }
+        if staff_role:
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+        channel = await guild.create_text_channel(
+            name=f"ticket-{interaction.user.name}"[:95],
+            category=category,
+            overwrites=overwrites,
+            topic=f"xmodda-ticket:{interaction.user.id}",
+            reason="XModda ticket opened",
+        )
+        view = CloseTicketView()
+        await channel.send(
+            f"🎫 Welcome {interaction.user.mention}!\nPlease explain your issue. "
+            f"{staff_role.mention if staff_role else ''}",
+            view=view,
+        )
+        await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        await send_log(guild, "Ticket opened", f"{interaction.user.mention} opened {channel.mention}")
+
+
+class CloseTicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, emoji="🔒", custom_id="xmodda:ticket_close")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (isinstance(interaction.user, discord.Member) and (is_staff(interaction.user) or interaction.channel.topic == f"xmodda-ticket:{interaction.user.id}")):
+            return await interaction.response.send_message("❌ You cannot close this ticket.", ephemeral=True)
+        await interaction.response.send_message("🔒 Closing ticket...", ephemeral=True)
+        await send_log(interaction.guild, "Ticket closed", f"{interaction.channel.mention} closed by {interaction.user.mention}")
+        await asyncio.sleep(1)
+        await interaction.channel.delete(reason="XModda ticket closed")
+
+
+@bot.tree.command(name="ticket_config", description="Configure the ticket system")
+@app_commands.describe(category="Ticket category", staff_role="Staff role")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_config(interaction: discord.Interaction, category: discord.CategoryChannel, staff_role: discord.Role):
+    await save_settings(interaction.guild.id, {
+        "tickets": True,
+        "ticketCategoryId": category.id,
+        "ticketStaffRoleId": staff_role.id,
+    })
+    await interaction.response.send_message(f"✅ Tickets configured. Category: {category.name} | Staff: {staff_role.mention}", ephemeral=True)
+
+
+@bot.tree.command(name="ticket_panel", description="Post the ticket panel in the current channel")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def ticket_panel(interaction: discord.Interaction):
+    await interaction.response.send_message("🎫 **Support Tickets**\nClick below to open a private support ticket.", view=TicketView())
+
+# ---------- Error handler ----------
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.MissingPermissions):
+        msg = "You do not have the required Discord permission for this command."
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        msg = "That command is on cooldown."
+    else:
+        print(f"[Command Error] {repr(error)}")
+        msg = "Something went wrong while running that command. Check the bot logs."
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+
+# ---------- Main ----------
+def main():
+    import threading
+    threading.Thread(target=run_health, daemon=True).start()
+    bot.add_view(TicketView())
+    bot.add_view(CloseTicketView())
+    bot.run(DISCORD_TOKEN)
+
+
+if __name__ == "__main__":
+    main()
