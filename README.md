@@ -1,4 +1,4 @@
-# XGuard Full Bot
+# XModda Full Bot
 
 Deploy `main.py` and `requirements.txt` to Render.
 
@@ -16,7 +16,7 @@ Required Discord intents:
 
 Required bot permissions depend on enabled features; for the full build use View Channels, Send Messages, Read Message History, Manage Messages, Moderate Members, Manage Channels, Manage Roles, Kick Members, and Ban Members.
 
-Diagnostics: `/xguard_diag`
+Diagnostics: `/xmodda_diag`
 AutoMod status: `/automod_status`
 Reload settings: `/automod_reload`
 

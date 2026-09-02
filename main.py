@@ -5,13 +5,15 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
 import discord
 import aiohttp
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
 
-logging.basicConfig(level=logging.INFO, format='[XGuard] %(message)s')
+logging.basicConfig(level=logging.INFO, format='[XModda] %(message)s')
 log = logging.getLogger('xmodda')
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', '').strip()
@@ -32,10 +34,10 @@ DEFAULTS = {
     'welcome': False, 'welcomeChannelId': '',
     'welcomeTitle': '👋 Welcome to {server}!',
     'welcomeMessage': 'Welcome {user} to **{server}**! You are member #{count}.',
-    'welcomeEmbedColor': '#5865F2', 'welcomeThumbnail': '', 'welcomeImage': '', 'welcomeFooter': '',
+    'welcomeEmbedColor': '#5865F2', 'welcomeThumbnail': '', 'welcomeImage': '', 'welcomeFooter': '', 'welcomeDynamicBanner': True,
     'goodbye': False, 'goodbyeChannelId': '', 'goodbyeTitle': '👋 Goodbye!',
     'goodbyeMessage': '**{username}** has left {server}.',
-    'goodbyeEmbedColor': '#ED4245', 'goodbyeThumbnail': '', 'goodbyeImage': '', 'goodbyeFooter': '',
+    'goodbyeEmbedColor': '#ED4245', 'goodbyeThumbnail': '', 'goodbyeImage': '', 'goodbyeFooter': '', 'goodbyeDynamicBanner': True,
     'autoRole': False, 'autoRoleId': '', 'autoRoleIds': [], 'tickets': True, 'ticketCategoryId': '',
     'ticketStaffRoleId': '', 'ticketStaffRoleIds': [], 'ticketLogChannelId': '', 'ticketPanelChannelId': '',
     'ticketLimit': 1, 'ticketPanelTitle': 'Support Tickets',
@@ -47,6 +49,118 @@ DEFAULTS = {
 
 URL_RE = re.compile(r'(?:https?://|www\.)\S+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|gg|io|co|me|tv|dev|xyz|info|site|online|app|ly|us|uk|ca)\b', re.I)
 INVITE_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[A-Za-z0-9-]+', re.I)
+
+# ---------------- Dynamic welcome/goodbye banners ----------------
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+BANNER_DIR = os.path.join(BOT_DIR, 'assets')
+WELCOME_BANNER_PATH = os.path.join(BANNER_DIR, 'welcome.png')
+GOODBYE_BANNER_PATH = os.path.join(BANNER_DIR, 'goodbye.png')
+BANNER_SIZE = (1983, 793)
+AVATAR_CENTER = (842, 463)
+AVATAR_SIZE = 84
+NAME_CENTER_X = 842
+NAME_Y = 543
+NAME_MAX_WIDTH = 620
+
+
+def _font(size):
+    candidates = [
+        os.path.join(BOT_DIR, 'assets', 'DejaVuSans-Bold.ttf'),
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',
+        'C:/Windows/Fonts/arialbd.ttf',
+    ]
+    for candidate in candidates:
+        try:
+            if os.path.exists(candidate):
+                return ImageFont.truetype(candidate, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _fit_name_font(draw, name):
+    size = 42
+    while size > 22:
+        f = _font(size)
+        box = draw.textbbox((0, 0), name, font=f)
+        if box[2] - box[0] <= NAME_MAX_WIDTH:
+            return f
+        size -= 1
+    return _font(22)
+
+
+async def _download_member_avatar(member):
+    url = str(member.display_avatar.replace(size=256).url)
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, allow_redirects=True) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f'Discord avatar HTTP {resp.status}')
+            data = await resp.content.read(4 * 1024 * 1024 + 1)
+            if len(data) > 4 * 1024 * 1024:
+                raise RuntimeError('Discord avatar is too large')
+            return data
+
+
+async def _dynamic_member_banner(member, kind):
+    template_path = WELCOME_BANNER_PATH if kind == 'welcome' else GOODBYE_BANNER_PATH
+    if not os.path.exists(template_path):
+        raise RuntimeError(f'Missing dynamic banner template: {template_path}')
+
+    avatar_bytes = await _download_member_avatar(member)
+    base = Image.open(template_path).convert('RGBA')
+    if base.size != BANNER_SIZE:
+        base = base.resize(BANNER_SIZE, Image.Resampling.LANCZOS)
+
+    avatar = Image.open(io.BytesIO(avatar_bytes)).convert('RGBA')
+    avatar.thumbnail((AVATAR_SIZE, AVATAR_SIZE), Image.Resampling.LANCZOS)
+
+    # Circular avatar mask.
+    circle = Image.new('L', (AVATAR_SIZE, AVATAR_SIZE), 0)
+    ImageDraw.Draw(circle).ellipse((0, 0, AVATAR_SIZE - 1, AVATAR_SIZE - 1), fill=255)
+    avatar_canvas = Image.new('RGBA', (AVATAR_SIZE, AVATAR_SIZE), (0, 0, 0, 0))
+    ax = (AVATAR_SIZE - avatar.width) // 2
+    ay = (AVATAR_SIZE - avatar.height) // 2
+    avatar_canvas.paste(avatar, (ax, ay), avatar)
+    avatar_canvas.putalpha(circle)
+
+    cx, cy = AVATAR_CENTER
+
+    # Purple glow.
+    glow = Image.new('RGBA', base.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((cx - 50, cy - 50, cx + 50, cy + 50), fill=(83, 43, 220, 150))
+    glow = glow.filter(ImageFilter.GaussianBlur(18))
+    base.alpha_composite(glow)
+
+    # White outer ring.
+    ring = Image.new('RGBA', base.size, (0, 0, 0, 0))
+    rd = ImageDraw.Draw(ring)
+    rd.ellipse((cx - 47, cy - 47, cx + 47, cy + 47), fill=(255, 255, 255, 255))
+    base.alpha_composite(ring)
+    base.alpha_composite(avatar_canvas, (cx - AVATAR_SIZE // 2, cy - AVATAR_SIZE // 2))
+
+    # Display name below the avatar.
+    name = str(member.display_name or member.name or member.id)
+    layer = Image.new('RGBA', base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    font = _fit_name_font(draw, name)
+    bbox = draw.textbbox((0, 0), name, font=font)
+    tw = bbox[2] - bbox[0]
+    th = bbox[3] - bbox[1]
+    tx = NAME_CENTER_X - tw / 2
+    ty = NAME_Y - th / 2
+    # Small shadow, then the same deep-purple text as the banner.
+    draw.text((tx + 2, ty + 2), name, font=font, fill=(40, 18, 105, 80))
+    draw.text((tx, ty), name, font=font, fill=(50, 22, 155, 255))
+    base.alpha_composite(layer)
+
+    output = io.BytesIO()
+    base.save(output, format='PNG', optimize=True)
+    output.seek(0)
+    return discord.File(output, filename=f'xmodda-{kind}-{member.id}.png')
+
 
 settings_cache = {}
 settings_cache_at = {}
@@ -60,7 +174,7 @@ ticket_claims = {}
 health = Flask(__name__)
 @health.get('/')
 def health_root():
-    return 'XGuard is online'
+    return 'XModda is online'
 
 def run_health():
     health.run(host='0.0.0.0', port=PORT)
@@ -149,10 +263,10 @@ async def run_automations(guild, trigger, *, member=None, message=None):
             if action=='send_log': await send_log(guild,'Automation',f"**{rule.get('name','Automation')}** triggered for {member.mention if member else 'a message'}",0x5865F2,'auto')
             elif action=='send_message' and message is not None: await message.channel.send(value.replace('{user}',member.mention if member else message.author.mention),delete_after=15)
             elif action=='timeout' and member is not None and isinstance(member,discord.Member) and guild.me and guild.me.guild_permissions.moderate_members and member.top_role<guild.me.top_role:
-                await member.timeout(dt.timedelta(minutes=max(1,int(value or 5))),reason=f"XGuard automation: {rule.get('name','Automation')}")
+                await member.timeout(dt.timedelta(minutes=max(1,int(value or 5))),reason=f"XModda automation: {rule.get('name','Automation')}")
             elif action=='add_role' and member is not None and isinstance(member,discord.Member):
                 rid=int(value); role=guild.get_role(rid)
-                if role and guild.me and guild.me.guild_permissions.manage_roles and role<guild.me.top_role: await member.add_roles(role,reason='XGuard automation')
+                if role and guild.me and guild.me.guild_permissions.manage_roles and role<guild.me.top_role: await member.add_roles(role,reason='XModda automation')
             elif action=='warn' and member is not None:
                 key=f'warnings_{guild.id}'; ss=await get_settings(guild.id,True); wm=ss.get(key,{}) or {}; uid=str(member.id); wm[uid]=int(wm.get(uid,0))+1; await save_settings(guild.id,{key:wm})
         except Exception as ex: log.warning('automation %s failed: %s',rule.get('name'),ex)
@@ -259,7 +373,7 @@ async def violation(message, reason, settings):
     if len(h) >= threshold and minutes and me and me.guild_permissions.moderate_members:
         if isinstance(message.author, discord.Member) and message.author.top_role < me.top_role:
             try:
-                await message.author.timeout(dt.timedelta(minutes=minutes), reason=f'XGuard AutoMod: {reason}')
+                await message.author.timeout(dt.timedelta(minutes=minutes), reason=f'XModda AutoMod: {reason}')
             except discord.HTTPException as exc:
                 log.warning('AutoMod timeout failed: %s', exc)
     await send_log(message.guild, 'AutoMod action', f'**User:** {message.author.mention}\n**Channel:** {message.channel.mention}\n**Reason:** {reason}', 0xED4245, 'auto')
@@ -375,16 +489,30 @@ async def _member_embed(settings, member, kind):
     if title.strip(): embed.title = title
     if description.strip(): embed.description = description
     files=[]
+    dynamic_key = 'welcomeDynamicBanner' if kind == 'welcome' else 'goodbyeDynamicBanner'
+    if settings.get(dynamic_key, True):
+        try:
+            banner_file = await _dynamic_member_banner(member, kind)
+            embed.set_image(url=f'attachment://{banner_file.filename}')
+            files.append(banner_file)
+        except Exception as exc:
+            log.warning('dynamic %s banner failed; falling back to configured image: %s', kind, exc)
+            image_file=await _download_member_image(image, f'{kind}-image')
+            if image_file:
+                embed.set_image(url=f'attachment://{image_file.filename}'); files.append(image_file)
+            elif image and str(image).strip().startswith(('http://','https://')):
+                embed.set_image(url=str(image).strip())
+    else:
+        image_file=await _download_member_image(image, f'{kind}-image')
+        if image_file:
+            embed.set_image(url=f'attachment://{image_file.filename}'); files.append(image_file)
+        elif image and str(image).strip().startswith(('http://','https://')):
+            embed.set_image(url=str(image).strip())
     thumb_file=await _download_member_image(thumbnail, f'{kind}-thumb')
-    image_file=await _download_member_image(image, f'{kind}-image')
     if thumb_file:
         embed.set_thumbnail(url=f'attachment://{thumb_file.filename}'); files.append(thumb_file)
     elif thumbnail and str(thumbnail).strip().startswith(('http://','https://')):
         embed.set_thumbnail(url=str(thumbnail).strip())
-    if image_file:
-        embed.set_image(url=f'attachment://{image_file.filename}'); files.append(image_file)
-    elif image and str(image).strip().startswith(('http://','https://')):
-        embed.set_image(url=str(image).strip())
     if footer.strip():
         if member.guild.icon:
             embed.set_footer(text=footer, icon_url=member.guild.icon.url)
@@ -410,7 +538,7 @@ async def on_member_join(member):
             for rid in ids:
                 role=member.guild.get_role(int(rid)) if str(rid).isdigit() else None
                 if role and role < me.top_role:
-                    try: await member.add_roles(role, reason='XGuard auto-role')
+                    try: await member.add_roles(role, reason='XModda auto-role')
                     except discord.HTTPException as exc: log.warning('auto-role failed for %s: %s',role.name,exc)
     await run_automations(member.guild,'member_join',member=member)
     if s.get('raid'):
@@ -434,20 +562,20 @@ async def on_member_remove(member):
     await send_log(member.guild, 'Member left', f'**Member:** {member} (`{member.id}`)', 0xED4245, 'leave')
 
 # ---------------- Helpers ----------------
-def ok(text): return discord.Embed(title='XGuard', description='✅ ' + text, color=0x57F287)
-def err(text): return discord.Embed(title='XGuard', description='❌ ' + text, color=0xED4245)
+def ok(text): return discord.Embed(title='XModda', description='✅ ' + text, color=0x57F287)
+def err(text): return discord.Embed(title='XModda', description='❌ ' + text, color=0xED4245)
 
 def require_guild(i):
     return i.guild is not None
 
 # ---------------- General ----------------
-@bot.tree.command(name='ping', description='Check XGuard latency')
+@bot.tree.command(name='ping', description='Check XModda latency')
 async def ping(i): await i.response.send_message(f'🏓 Pong! `{round(bot.latency * 1000)}ms`', ephemeral=True)
 
-@bot.tree.command(name='xguard_diag', description='Test XGuard Discord and Supabase connectivity')
+@bot.tree.command(name='xmodda_diag', description='Test XModda Discord and Supabase connectivity')
 @app_commands.checks.has_permissions(manage_guild=True)
-async def xguard_diag(i):
-    e = discord.Embed(title='XGuard Diagnostics', color=0x5865F2)
+async def xmodda_diag(i):
+    e = discord.Embed(title='XModda Diagnostics', color=0x5865F2)
     me = i.guild.me; p = me.guild_permissions if me else None
     e.add_field(name='Discord Gateway', value='🟢 Connected', inline=True)
     e.add_field(name='Message Content', value='🟢 Enabled in code', inline=True)
@@ -519,7 +647,7 @@ async def clearwarnings(i, member: discord.Member):
 async def automod_status(i):
     try: s=await get_settings(i.guild.id,True)
     except Exception as ex: return await i.response.send_message(embed=err(f'Database error: {ex}'),ephemeral=True)
-    e=discord.Embed(title='XGuard AutoMod Status',color=0x5865F2)
+    e=discord.Embed(title='XModda AutoMod Status',color=0x5865F2)
     for k,l in [('antiLinks','Anti-Links'),('antiInvites','Anti-Invites'),('antiSpam','Anti-Spam'),('duplicate','Duplicate'),('caps','Excessive Caps'),('badWords','Bad Words'),('raid','Raid Protection')]: e.add_field(name=l,value='🟢 ON' if s.get(k) else '🔴 OFF',inline=True)
     e.add_field(name='Spam',value=f"{s['antiSpamLimit']} msgs / {s['antiSpamWindow']}s",inline=True); e.add_field(name='Duplicate',value=f"{s['duplicateLimit']} repeats / {s['duplicateWindow']}s",inline=True); e.add_field(name='Caps',value=f"{s['capsPercent']}% / {s['capsMinLength']} letters",inline=True); await i.response.send_message(embed=e,ephemeral=True)
 
@@ -573,7 +701,7 @@ async def goodbye_disable(i): await save_settings(i.guild.id,{'goodbye':False});
 @bot.tree.command(name='autorole', description='Set the automatic member role')
 @app_commands.checks.has_permissions(manage_roles=True)
 async def autorole(i, role: discord.Role):
-    if i.guild.me and role >= i.guild.me.top_role: return await i.response.send_message(embed=err("That role must be below XGuard's highest role."),ephemeral=True)
+    if i.guild.me and role >= i.guild.me.top_role: return await i.response.send_message(embed=err("That role must be below XModda's highest role."),ephemeral=True)
     try: await save_settings(i.guild.id,{'autoRole':True,'autoRoleId':role.id})
     except Exception as ex: return await i.response.send_message(embed=err(f'Could not save auto-role settings: {ex}'),ephemeral=True)
     await i.response.send_message(f'✅ Auto-role enabled: {role.mention}',ephemeral=True)
@@ -659,7 +787,7 @@ async def open_ticket(i):
     ow={g.default_role:discord.PermissionOverwrite(view_channel=False),i.user:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True),g.me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,read_message_history=True)}
     for r in staff_roles: ow[r]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
     try:
-        ch=await g.create_text_channel(_ticket_name(s,i),category=category,overwrites=ow,topic=f'xmodda-ticket:{i.user.id}',reason='XGuard ticket opened')
+        ch=await g.create_text_channel(_ticket_name(s,i),category=category,overwrites=ow,topic=f'xmodda-ticket:{i.user.id}',reason='XModda ticket opened')
         title=str(s.get('ticketOpenedTitle') or 'Ticket Created'); desc=_ticket_text(s.get('ticketOpenedDescription') or 'Welcome {user}! Please describe your issue.',i,g)
         e=discord.Embed(title=title,description=desc,color=_ticket_color(s.get('ticketOpenedColor')))
         if s.get('ticketOpenedThumbnail'): e.set_thumbnail(url=str(s['ticketOpenedThumbnail']))
@@ -713,7 +841,7 @@ class TicketManageView(discord.ui.View):
         await save_transcript(i.channel,i.user)
         await send_log(i.guild,'Ticket closed',f'{i.channel.mention} closed by {i.user.mention}',0x5865F2,'ticket')
         ticket_claims.pop(i.channel.id,None)
-        try: await i.channel.delete(reason='XGuard ticket closed')
+        try: await i.channel.delete(reason='XModda ticket closed')
         except discord.HTTPException: pass
 
 class TicketRenameModal(discord.ui.Modal,title='Rename Ticket'):
