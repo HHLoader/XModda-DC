@@ -186,10 +186,10 @@ async def run_automations(guild, trigger, *, member=None, message=None):
             if action=='send_log': await send_log(guild,'Automation',f"**{rule.get('name','Automation')}** triggered for {member.mention if member else 'a message'}",0x5865F2,'auto')
             elif action=='send_message' and message is not None: await message.channel.send(value.replace('{user}',member.mention if member else message.author.mention),delete_after=15)
             elif action=='timeout' and member is not None and isinstance(member,discord.Member) and guild.me and guild.me.guild_permissions.moderate_members and member.top_role<guild.me.top_role:
-                await member.timeout(dt.timedelta(minutes=max(1,int(value or 5))),reason=f"XModda automation: {rule.get('name','Automation')}")
+                await member.timeout(dt.timedelta(minutes=max(1,int(value or 5))),reason=f"XGuard automation: {rule.get('name','Automation')}")
             elif action=='add_role' and member is not None and isinstance(member,discord.Member):
                 rid=int(value); role=guild.get_role(rid)
-                if role and guild.me and guild.me.guild_permissions.manage_roles and role<guild.me.top_role: await member.add_roles(role,reason='XModda automation')
+                if role and guild.me and guild.me.guild_permissions.manage_roles and role<guild.me.top_role: await member.add_roles(role,reason='XGuard automation')
             elif action=='warn' and member is not None:
                 key=f'warnings_{guild.id}'; ss=await get_settings(guild.id,True); wm=ss.get(key,{}) or {}; uid=str(member.id); wm[uid]=int(wm.get(uid,0))+1; await save_settings(guild.id,{key:wm})
         except Exception as ex: log.warning('automation %s failed: %s',rule.get('name'),ex)
@@ -296,7 +296,7 @@ async def violation(message, reason, settings):
     if len(h) >= threshold and minutes and me and me.guild_permissions.moderate_members:
         if isinstance(message.author, discord.Member) and message.author.top_role < me.top_role:
             try:
-                await message.author.timeout(dt.timedelta(minutes=minutes), reason=f'XModda AutoMod: {reason}')
+                await message.author.timeout(dt.timedelta(minutes=minutes), reason=f'XGuard AutoMod: {reason}')
             except discord.HTTPException as exc:
                 log.warning('AutoMod timeout failed: %s', exc)
     await send_log(message.guild, 'AutoMod action', f'**User:** {message.author.mention}\n**Channel:** {message.channel.mention}\n**Reason:** {reason}', 0xED4245, 'auto')
@@ -514,9 +514,9 @@ def require_guild(i):
 @bot.tree.command(name='ping', description='Check XGuard latency')
 async def ping(i): await i.response.send_message(f'🏓 Pong! `{round(bot.latency * 1000)}ms`', ephemeral=True)
 
-@bot.tree.command(name='xmodda_diag', description='Test XGuard Discord and Supabase connectivity')
+@bot.tree.command(name='xguard_diag', description='Test XGuard Discord and Supabase connectivity')
 @app_commands.checks.has_permissions(manage_guild=True)
-async def xmodda_diag(i):
+async def xguard_diag(i):
     e = discord.Embed(title='XGuard Diagnostics', color=0x5865F2)
     me = i.guild.me; p = me.guild_permissions if me else None
     e.add_field(name='Discord Gateway', value='🟢 Connected', inline=True)
@@ -589,7 +589,7 @@ async def clearwarnings(i, member: discord.Member):
 async def automod_status(i):
     try: s=await get_settings(i.guild.id,True)
     except Exception as ex: return await i.response.send_message(embed=err(f'Database error: {ex}'),ephemeral=True)
-    e=discord.Embed(title='XModda AutoMod Status',color=0x5865F2)
+    e=discord.Embed(title='XGuard AutoMod Status',color=0x5865F2)
     for k,l in [('antiLinks','Anti-Links'),('antiInvites','Anti-Invites'),('antiSpam','Anti-Spam'),('duplicate','Duplicate'),('caps','Excessive Caps'),('badWords','Bad Words'),('raid','Raid Protection')]: e.add_field(name=l,value='🟢 ON' if s.get(k) else '🔴 OFF',inline=True)
     e.add_field(name='Spam',value=f"{s['antiSpamLimit']} msgs / {s['antiSpamWindow']}s",inline=True); e.add_field(name='Duplicate',value=f"{s['duplicateLimit']} repeats / {s['duplicateWindow']}s",inline=True); e.add_field(name='Caps',value=f"{s['capsPercent']}% / {s['capsMinLength']} letters",inline=True); await i.response.send_message(embed=e,ephemeral=True)
 
@@ -643,7 +643,7 @@ async def goodbye_disable(i): await save_settings(i.guild.id,{'goodbye':False});
 @bot.tree.command(name='autorole', description='Set the automatic member role')
 @app_commands.checks.has_permissions(manage_roles=True)
 async def autorole(i, role: discord.Role):
-    if i.guild.me and role >= i.guild.me.top_role: return await i.response.send_message(embed=err("That role must be below XModda's highest role."),ephemeral=True)
+    if i.guild.me and role >= i.guild.me.top_role: return await i.response.send_message(embed=err("That role must be below XGuard's highest role."),ephemeral=True)
     try: await save_settings(i.guild.id,{'autoRole':True,'autoRoleId':role.id})
     except Exception as ex: return await i.response.send_message(embed=err(f'Could not save auto-role settings: {ex}'),ephemeral=True)
     await i.response.send_message(f'✅ Auto-role enabled: {role.mention}',ephemeral=True)
@@ -723,13 +723,13 @@ async def open_ticket(i):
     category=g.get_channel(int(s['ticketCategoryId'])) if str(s.get('ticketCategoryId','')).isdigit() else None
     staff_ids=_ticket_staff_ids(s); staff_roles=[g.get_role(rid) for rid in staff_ids]; staff_roles=[r for r in staff_roles if r]
     if not isinstance(category,discord.CategoryChannel) or not staff_roles: return await i.response.send_message('❌ Tickets are not configured yet. Choose a category and at least one allowed staff role in the dashboard.',ephemeral=True)
-    existing=[c for c in category.channels if isinstance(c,discord.TextChannel) and c.topic==f'xmodda-ticket:{i.user.id}']
+    existing=[c for c in category.channels if isinstance(c,discord.TextChannel) and c.topic==f'xguard-ticket:{i.user.id}']
     limit=max(1,int(s.get('ticketLimit',1) or 1))
     if len(existing)>=limit: return await i.response.send_message(f'❌ You already have the maximum of {limit} open ticket(s).',ephemeral=True)
     ow={g.default_role:discord.PermissionOverwrite(view_channel=False),i.user:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True),g.me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,read_message_history=True)}
     for r in staff_roles: ow[r]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
     try:
-        ch=await g.create_text_channel(_ticket_name(s,i),category=category,overwrites=ow,topic=f'xmodda-ticket:{i.user.id}',reason='XModda ticket opened')
+        ch=await g.create_text_channel(_ticket_name(s,i),category=category,overwrites=ow,topic=f'xguard-ticket:{i.user.id}',reason='XGuard ticket opened')
         title=str(s.get('ticketOpenedTitle') or 'Ticket Created'); desc=_ticket_text(s.get('ticketOpenedDescription') or 'Welcome {user}! Please describe your issue.',i,g)
         e=discord.Embed(title=title,description=desc,color=_ticket_color(s.get('ticketOpenedColor')))
         if s.get('ticketOpenedThumbnail'): e.set_thumbnail(url=str(s['ticketOpenedThumbnail']))
@@ -739,7 +739,7 @@ async def open_ticket(i):
 
 class TicketPanelView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label='Open Ticket', style=discord.ButtonStyle.primary, emoji='🎫', custom_id='xmodda_ticket_open_v3')
+    @discord.ui.button(label='Open Ticket', style=discord.ButtonStyle.primary, emoji='🎫', custom_id='xguard_ticket_open_v3')
     async def open_button(self, i, button): await open_ticket(i)
 
 async def save_transcript(channel, closer):
@@ -760,22 +760,22 @@ async def save_transcript(channel, closer):
 
 class TicketManageView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label='Claim', style=discord.ButtonStyle.success, emoji='🙋', custom_id='xmodda:ticket_claim')
+    @discord.ui.button(label='Claim', style=discord.ButtonStyle.success, emoji='🙋', custom_id='xguard:ticket_claim')
     async def claim(self, i, button):
         s=await get_settings(i.guild.id,True)
         if not isinstance(i.user,discord.Member) or not is_staff(i.user,s): return await i.response.send_message('❌ Only configured ticket staff can claim tickets.',ephemeral=True)
         if i.channel.id in ticket_claims: return await i.response.send_message('❌ This ticket is already claimed.',ephemeral=True)
         ticket_claims[i.channel.id]=i.user.id; button.disabled=True; button.label=f'Claimed by {i.user.display_name}'[:80]
         await i.message.edit(view=self); await i.response.send_message(f'🙋 Ticket claimed by {i.user.mention}.',ephemeral=False)
-    @discord.ui.button(label='Rename', style=discord.ButtonStyle.secondary, emoji='✏️', custom_id='xmodda:ticket_rename')
+    @discord.ui.button(label='Rename', style=discord.ButtonStyle.secondary, emoji='✏️', custom_id='xguard:ticket_rename')
     async def rename(self, i, button):
         s=await get_settings(i.guild.id,True)
         if not isinstance(i.user,discord.Member) or not is_staff(i.user,s): return await i.response.send_message('❌ Only configured ticket staff can rename tickets.',ephemeral=True)
         await i.response.send_modal(TicketRenameModal())
-    @discord.ui.button(label='Close Ticket', style=discord.ButtonStyle.danger, emoji='🔒', custom_id='xmodda:ticket_close')
+    @discord.ui.button(label='Close Ticket', style=discord.ButtonStyle.danger, emoji='🔒', custom_id='xguard:ticket_close')
     async def close(self, i, button):
         s=await get_settings(i.guild.id,True)
-        if not isinstance(i.user,discord.Member) or not (is_staff(i.user,s) or (i.channel.topic or '')==f'xmodda-ticket:{i.user.id}'):
+        if not isinstance(i.user,discord.Member) or not (is_staff(i.user,s) or (i.channel.topic or '')==f'xguard-ticket:{i.user.id}'):
             return await i.response.send_message('❌ You cannot close this ticket.',ephemeral=True)
         await i.response.send_message('🔒 Closing ticket in 5 seconds…',ephemeral=True)
         for n in range(4,0,-1):
@@ -783,7 +783,7 @@ class TicketManageView(discord.ui.View):
         await save_transcript(i.channel,i.user)
         await send_log(i.guild,'Ticket closed',f'{i.channel.mention} closed by {i.user.mention}',0x5865F2,'ticket')
         ticket_claims.pop(i.channel.id,None)
-        try: await i.channel.delete(reason='XModda ticket closed')
+        try: await i.channel.delete(reason='XGuard ticket closed')
         except discord.HTTPException: pass
 
 class TicketRenameModal(discord.ui.Modal,title='Rename Ticket'):
@@ -839,7 +839,7 @@ async def on_interaction(interaction: discord.Interaction):
             return
         data = interaction.data or {}
         custom_id = str(data.get('custom_id') or '')
-        if custom_id not in {'xmodda:ticket_open', 'xmodda_ticket_open_v3'}:
+        if custom_id not in {'xguard:ticket_open', 'xguard_ticket_open_v3'}:
             return
         if interaction.response.is_done():
             return
