@@ -11,10 +11,10 @@ import discord
 import aiohttp
 from discord import app_commands
 from discord.ext import commands
-from flask import Flask
+from flask import Flask, request
 
-logging.basicConfig(level=logging.INFO, format='[XModda] %(message)s')
-log = logging.getLogger('xmodda')
+logging.basicConfig(level=logging.INFO, format='[XGuard] %(message)s')
+log = logging.getLogger('xguard')
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', '').strip()
 SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip().rstrip('/')
@@ -90,8 +90,10 @@ def _fit_name_font(draw, name):
     return _font(22)
 
 
-async def _download_member_avatar(member):
-    url = str(member.display_avatar.replace(size=256).url)
+async def _download_avatar_url(url):
+    url = str(url or '').strip()
+    if not url.startswith(('http://','https://')):
+        raise RuntimeError('Missing member avatar URL')
     timeout = aiohttp.ClientTimeout(total=8)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url, allow_redirects=True) as resp:
@@ -102,21 +104,21 @@ async def _download_member_avatar(member):
                 raise RuntimeError('Discord avatar is too large')
             return data
 
+async def _download_member_avatar(member):
+    return await _download_avatar_url(member.display_avatar.replace(size=256).url)
 
-async def _dynamic_member_banner(member, kind):
+async def _dynamic_member_banner_identity(avatar_url, display_name, kind, filename_id='preview'):
     template_path = WELCOME_BANNER_PATH if kind == 'welcome' else GOODBYE_BANNER_PATH
     if not os.path.exists(template_path):
         raise RuntimeError(f'Missing dynamic banner template: {template_path}')
 
-    avatar_bytes = await _download_member_avatar(member)
+    avatar_bytes = await _download_avatar_url(avatar_url)
     base = Image.open(template_path).convert('RGBA')
     if base.size != BANNER_SIZE:
         base = base.resize(BANNER_SIZE, Image.Resampling.LANCZOS)
 
     avatar = Image.open(io.BytesIO(avatar_bytes)).convert('RGBA')
     avatar.thumbnail((AVATAR_SIZE, AVATAR_SIZE), Image.Resampling.LANCZOS)
-
-    # Circular avatar mask.
     circle = Image.new('L', (AVATAR_SIZE, AVATAR_SIZE), 0)
     ImageDraw.Draw(circle).ellipse((0, 0, AVATAR_SIZE - 1, AVATAR_SIZE - 1), fill=255)
     avatar_canvas = Image.new('RGBA', (AVATAR_SIZE, AVATAR_SIZE), (0, 0, 0, 0))
@@ -126,32 +128,22 @@ async def _dynamic_member_banner(member, kind):
     avatar_canvas.putalpha(circle)
 
     cx, cy = AVATAR_CENTER
-
-    # Purple glow.
     glow = Image.new('RGBA', base.size, (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
     gd.ellipse((cx - 50, cy - 50, cx + 50, cy + 50), fill=(83, 43, 220, 150))
-    glow = glow.filter(ImageFilter.GaussianBlur(18))
-    base.alpha_composite(glow)
-
-    # White outer ring.
+    base.alpha_composite(glow.filter(ImageFilter.GaussianBlur(18)))
     ring = Image.new('RGBA', base.size, (0, 0, 0, 0))
-    rd = ImageDraw.Draw(ring)
-    rd.ellipse((cx - 47, cy - 47, cx + 47, cy + 47), fill=(255, 255, 255, 255))
+    ImageDraw.Draw(ring).ellipse((cx - 47, cy - 47, cx + 47, cy + 47), fill=(255, 255, 255, 255))
     base.alpha_composite(ring)
     base.alpha_composite(avatar_canvas, (cx - AVATAR_SIZE // 2, cy - AVATAR_SIZE // 2))
 
-    # Display name below the avatar.
-    name = str(member.display_name or member.name or member.id)
+    name = str(display_name or 'Discord User')
     layer = Image.new('RGBA', base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
     font = _fit_name_font(draw, name)
     bbox = draw.textbbox((0, 0), name, font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    tx = NAME_CENTER_X - tw / 2
-    ty = NAME_Y - th / 2
-    # Small shadow, then the same deep-purple text as the banner.
+    tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
+    tx = NAME_CENTER_X - tw / 2; ty = NAME_Y - th / 2
     draw.text((tx + 2, ty + 2), name, font=font, fill=(40, 18, 105, 80))
     draw.text((tx, ty), name, font=font, fill=(50, 22, 155, 255))
     base.alpha_composite(layer)
@@ -159,7 +151,15 @@ async def _dynamic_member_banner(member, kind):
     output = io.BytesIO()
     base.save(output, format='PNG', optimize=True)
     output.seek(0)
-    return discord.File(output, filename=f'xmodda-{kind}-{member.id}.png')
+    return discord.File(output, filename=f'xguard-{kind}-{filename_id}.png')
+
+async def _dynamic_member_banner(member, kind):
+    return await _dynamic_member_banner_identity(
+        member.display_avatar.replace(size=256).url,
+        member.display_name or member.name,
+        kind,
+        member.id,
+    )
 
 
 settings_cache = {}
@@ -174,7 +174,44 @@ ticket_claims = {}
 health = Flask(__name__)
 @health.get('/')
 def health_root():
-    return 'XModda is online'
+    return 'XGuard is online'
+
+
+@health.post('/dashboard/member-message-test')
+def dashboard_member_message_test():
+    """Authenticated dashboard bridge: render the same dynamic banner used by real member events."""
+    try:
+        auth = request.headers.get('Authorization', '')
+        if auth != f'Bot {DISCORD_TOKEN}':
+            return {'error': 'Unauthorized'}, 401
+        payload = request.get_json(silent=True) or {}
+        guild_id = str(payload.get('guildId') or '')
+        channel_id = str(payload.get('channelId') or '')
+        kind = 'goodbye' if payload.get('kind') == 'goodbye' else 'welcome'
+        user_id = str(payload.get('userId') or '')
+        settings = payload.get('settings') or {}
+        if not guild_id or not channel_id or not user_id:
+            return {'error': 'guildId, channelId and userId are required'}, 400
+        guild = bot.get_guild(int(guild_id))
+        if not guild:
+            return {'error': 'Bot is not connected to that server.'}, 404
+        member = guild.get_member(int(user_id))
+        if not member:
+            return {'error': 'The dashboard user is not currently a member of this server.'}, 404
+        channel = guild.get_channel(int(channel_id))
+        if not channel or not hasattr(channel, 'send'):
+            return {'error': 'The selected channel is unavailable.'}, 404
+
+        async def send_test():
+            embed, files = await _member_embed(settings, member, kind)
+            await channel.send(embed=embed, files=files)
+
+        future = asyncio.run_coroutine_threadsafe(send_test(), bot.loop)
+        future.result(timeout=25)
+        return {'ok': True}
+    except Exception as exc:
+        log.exception('dashboard member-message test failed')
+        return {'error': str(exc)[:900]}, 500
 
 def run_health():
     health.run(host='0.0.0.0', port=PORT)
@@ -538,7 +575,7 @@ async def on_member_join(member):
             for rid in ids:
                 role=member.guild.get_role(int(rid)) if str(rid).isdigit() else None
                 if role and role < me.top_role:
-                    try: await member.add_roles(role, reason='XModda auto-role')
+                    try: await member.add_roles(role, reason='XGuard auto-role')
                     except discord.HTTPException as exc: log.warning('auto-role failed for %s: %s',role.name,exc)
     await run_automations(member.guild,'member_join',member=member)
     if s.get('raid'):
@@ -562,20 +599,20 @@ async def on_member_remove(member):
     await send_log(member.guild, 'Member left', f'**Member:** {member} (`{member.id}`)', 0xED4245, 'leave')
 
 # ---------------- Helpers ----------------
-def ok(text): return discord.Embed(title='XModda', description='✅ ' + text, color=0x57F287)
-def err(text): return discord.Embed(title='XModda', description='❌ ' + text, color=0xED4245)
+def ok(text): return discord.Embed(title='XGuard', description='✅ ' + text, color=0x57F287)
+def err(text): return discord.Embed(title='XGuard', description='❌ ' + text, color=0xED4245)
 
 def require_guild(i):
     return i.guild is not None
 
 # ---------------- General ----------------
-@bot.tree.command(name='ping', description='Check XModda latency')
+@bot.tree.command(name='ping', description='Check XGuard latency')
 async def ping(i): await i.response.send_message(f'🏓 Pong! `{round(bot.latency * 1000)}ms`', ephemeral=True)
 
-@bot.tree.command(name='xmodda_diag', description='Test XModda Discord and Supabase connectivity')
+@bot.tree.command(name='xmodda_diag', description='Test XGuard Discord and Supabase connectivity')
 @app_commands.checks.has_permissions(manage_guild=True)
 async def xmodda_diag(i):
-    e = discord.Embed(title='XModda Diagnostics', color=0x5865F2)
+    e = discord.Embed(title='XGuard Diagnostics', color=0x5865F2)
     me = i.guild.me; p = me.guild_permissions if me else None
     e.add_field(name='Discord Gateway', value='🟢 Connected', inline=True)
     e.add_field(name='Message Content', value='🟢 Enabled in code', inline=True)
