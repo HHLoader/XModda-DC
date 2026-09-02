@@ -11,7 +11,7 @@ from discord import app_commands
 from discord.ext import commands
 from flask import Flask
 
-logging.basicConfig(level=logging.INFO, format='[XModda] %(message)s')
+logging.basicConfig(level=logging.INFO, format='[XGuard] %(message)s')
 log = logging.getLogger('xmodda')
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', '').strip()
@@ -60,7 +60,7 @@ ticket_claims = {}
 health = Flask(__name__)
 @health.get('/')
 def health_root():
-    return 'XModda is online'
+    return 'XGuard is online'
 
 def run_health():
     health.run(host='0.0.0.0', port=PORT)
@@ -149,10 +149,10 @@ async def run_automations(guild, trigger, *, member=None, message=None):
             if action=='send_log': await send_log(guild,'Automation',f"**{rule.get('name','Automation')}** triggered for {member.mention if member else 'a message'}",0x5865F2,'auto')
             elif action=='send_message' and message is not None: await message.channel.send(value.replace('{user}',member.mention if member else message.author.mention),delete_after=15)
             elif action=='timeout' and member is not None and isinstance(member,discord.Member) and guild.me and guild.me.guild_permissions.moderate_members and member.top_role<guild.me.top_role:
-                await member.timeout(dt.timedelta(minutes=max(1,int(value or 5))),reason=f"XModda automation: {rule.get('name','Automation')}")
+                await member.timeout(dt.timedelta(minutes=max(1,int(value or 5))),reason=f"XGuard automation: {rule.get('name','Automation')}")
             elif action=='add_role' and member is not None and isinstance(member,discord.Member):
                 rid=int(value); role=guild.get_role(rid)
-                if role and guild.me and guild.me.guild_permissions.manage_roles and role<guild.me.top_role: await member.add_roles(role,reason='XModda automation')
+                if role and guild.me and guild.me.guild_permissions.manage_roles and role<guild.me.top_role: await member.add_roles(role,reason='XGuard automation')
             elif action=='warn' and member is not None:
                 key=f'warnings_{guild.id}'; ss=await get_settings(guild.id,True); wm=ss.get(key,{}) or {}; uid=str(member.id); wm[uid]=int(wm.get(uid,0))+1; await save_settings(guild.id,{key:wm})
         except Exception as ex: log.warning('automation %s failed: %s',rule.get('name'),ex)
@@ -259,7 +259,7 @@ async def violation(message, reason, settings):
     if len(h) >= threshold and minutes and me and me.guild_permissions.moderate_members:
         if isinstance(message.author, discord.Member) and message.author.top_role < me.top_role:
             try:
-                await message.author.timeout(dt.timedelta(minutes=minutes), reason=f'XModda AutoMod: {reason}')
+                await message.author.timeout(dt.timedelta(minutes=minutes), reason=f'XGuard AutoMod: {reason}')
             except discord.HTTPException as exc:
                 log.warning('AutoMod timeout failed: %s', exc)
     await send_log(message.guild, 'AutoMod action', f'**User:** {message.author.mention}\n**Channel:** {message.channel.mention}\n**Reason:** {reason}', 0xED4245, 'auto')
@@ -410,7 +410,7 @@ async def on_member_join(member):
             for rid in ids:
                 role=member.guild.get_role(int(rid)) if str(rid).isdigit() else None
                 if role and role < me.top_role:
-                    try: await member.add_roles(role, reason='XModda auto-role')
+                    try: await member.add_roles(role, reason='XGuard auto-role')
                     except discord.HTTPException as exc: log.warning('auto-role failed for %s: %s',role.name,exc)
     await run_automations(member.guild,'member_join',member=member)
     if s.get('raid'):
@@ -434,20 +434,20 @@ async def on_member_remove(member):
     await send_log(member.guild, 'Member left', f'**Member:** {member} (`{member.id}`)', 0xED4245, 'leave')
 
 # ---------------- Helpers ----------------
-def ok(text): return discord.Embed(title='XModda', description='✅ ' + text, color=0x57F287)
-def err(text): return discord.Embed(title='XModda', description='❌ ' + text, color=0xED4245)
+def ok(text): return discord.Embed(title='XGuard', description='✅ ' + text, color=0x57F287)
+def err(text): return discord.Embed(title='XGuard', description='❌ ' + text, color=0xED4245)
 
 def require_guild(i):
     return i.guild is not None
 
 # ---------------- General ----------------
-@bot.tree.command(name='ping', description='Check XModda latency')
+@bot.tree.command(name='ping', description='Check XGuard latency')
 async def ping(i): await i.response.send_message(f'🏓 Pong! `{round(bot.latency * 1000)}ms`', ephemeral=True)
 
-@bot.tree.command(name='xmodda_diag', description='Test XModda Discord and Supabase connectivity')
+@bot.tree.command(name='xguard_diag', description='Test XGuard Discord and Supabase connectivity')
 @app_commands.checks.has_permissions(manage_guild=True)
-async def xmodda_diag(i):
-    e = discord.Embed(title='XModda Diagnostics', color=0x5865F2)
+async def xguard_diag(i):
+    e = discord.Embed(title='XGuard Diagnostics', color=0x5865F2)
     me = i.guild.me; p = me.guild_permissions if me else None
     e.add_field(name='Discord Gateway', value='🟢 Connected', inline=True)
     e.add_field(name='Message Content', value='🟢 Enabled in code', inline=True)
@@ -519,7 +519,7 @@ async def clearwarnings(i, member: discord.Member):
 async def automod_status(i):
     try: s=await get_settings(i.guild.id,True)
     except Exception as ex: return await i.response.send_message(embed=err(f'Database error: {ex}'),ephemeral=True)
-    e=discord.Embed(title='XModda AutoMod Status',color=0x5865F2)
+    e=discord.Embed(title='XGuard AutoMod Status',color=0x5865F2)
     for k,l in [('antiLinks','Anti-Links'),('antiInvites','Anti-Invites'),('antiSpam','Anti-Spam'),('duplicate','Duplicate'),('caps','Excessive Caps'),('badWords','Bad Words'),('raid','Raid Protection')]: e.add_field(name=l,value='🟢 ON' if s.get(k) else '🔴 OFF',inline=True)
     e.add_field(name='Spam',value=f"{s['antiSpamLimit']} msgs / {s['antiSpamWindow']}s",inline=True); e.add_field(name='Duplicate',value=f"{s['duplicateLimit']} repeats / {s['duplicateWindow']}s",inline=True); e.add_field(name='Caps',value=f"{s['capsPercent']}% / {s['capsMinLength']} letters",inline=True); await i.response.send_message(embed=e,ephemeral=True)
 
@@ -573,7 +573,7 @@ async def goodbye_disable(i): await save_settings(i.guild.id,{'goodbye':False});
 @bot.tree.command(name='autorole', description='Set the automatic member role')
 @app_commands.checks.has_permissions(manage_roles=True)
 async def autorole(i, role: discord.Role):
-    if i.guild.me and role >= i.guild.me.top_role: return await i.response.send_message(embed=err("That role must be below XModda's highest role."),ephemeral=True)
+    if i.guild.me and role >= i.guild.me.top_role: return await i.response.send_message(embed=err("That role must be below XGuard's highest role."),ephemeral=True)
     try: await save_settings(i.guild.id,{'autoRole':True,'autoRoleId':role.id})
     except Exception as ex: return await i.response.send_message(embed=err(f'Could not save auto-role settings: {ex}'),ephemeral=True)
     await i.response.send_message(f'✅ Auto-role enabled: {role.mention}',ephemeral=True)
@@ -659,7 +659,7 @@ async def open_ticket(i):
     ow={g.default_role:discord.PermissionOverwrite(view_channel=False),i.user:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True),g.me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,read_message_history=True)}
     for r in staff_roles: ow[r]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True)
     try:
-        ch=await g.create_text_channel(_ticket_name(s,i),category=category,overwrites=ow,topic=f'xmodda-ticket:{i.user.id}',reason='XModda ticket opened')
+        ch=await g.create_text_channel(_ticket_name(s,i),category=category,overwrites=ow,topic=f'xmodda-ticket:{i.user.id}',reason='XGuard ticket opened')
         title=str(s.get('ticketOpenedTitle') or 'Ticket Created'); desc=_ticket_text(s.get('ticketOpenedDescription') or 'Welcome {user}! Please describe your issue.',i,g)
         e=discord.Embed(title=title,description=desc,color=_ticket_color(s.get('ticketOpenedColor')))
         if s.get('ticketOpenedThumbnail'): e.set_thumbnail(url=str(s['ticketOpenedThumbnail']))
@@ -713,7 +713,7 @@ class TicketManageView(discord.ui.View):
         await save_transcript(i.channel,i.user)
         await send_log(i.guild,'Ticket closed',f'{i.channel.mention} closed by {i.user.mention}',0x5865F2,'ticket')
         ticket_claims.pop(i.channel.id,None)
-        try: await i.channel.delete(reason='XModda ticket closed')
+        try: await i.channel.delete(reason='XGuard ticket closed')
         except discord.HTTPException: pass
 
 class TicketRenameModal(discord.ui.Modal,title='Rename Ticket'):
