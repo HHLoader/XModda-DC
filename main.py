@@ -15,6 +15,7 @@ logging.basicConfig(level=logging.INFO, format='[XGuard] %(message)s')
 log = logging.getLogger('xguard')
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', '').strip()
+BOT_API_SECRET = os.getenv('BOT_API_SECRET', '').strip() or DISCORD_TOKEN
 SUPABASE_URL = os.getenv('SUPABASE_URL', '').strip().rstrip('/')
 SUPABASE_KEY = os.getenv('SUPABASE_SERVICE_ROLE_KEY', '').strip()
 PORT = int(os.getenv('PORT', '8080'))
@@ -68,7 +69,7 @@ def dashboard_member_message_test():
     """Authenticated dashboard bridge: send the same static welcome/goodbye embed used by member events."""
     try:
         auth = request.headers.get('Authorization', '')
-        if auth != f'Bot {DISCORD_TOKEN}':
+        if auth != f'Bearer {BOT_API_SECRET}':
             return {'error': 'Unauthorized'}, 401
         payload = request.get_json(silent=True) or {}
         guild_id = str(payload.get('guildId') or '')
@@ -76,8 +77,10 @@ def dashboard_member_message_test():
         kind = 'goodbye' if payload.get('kind') == 'goodbye' else 'welcome'
         user_id = str(payload.get('userId') or '')
         settings = payload.get('settings') or {}
-        if not guild_id or not channel_id or not user_id:
-            return {'error': 'guildId, channelId and userId are required'}, 400
+        if not isinstance(settings, dict) or len(json.dumps(settings)) > 150000:
+            return {'error': 'Invalid or oversized settings payload.'}, 400
+        if not re.fullmatch(r'\d{15,21}', guild_id) or not re.fullmatch(r'\d{15,21}', channel_id) or not re.fullmatch(r'\d{15,21}', user_id):
+            return {'error': 'Invalid Discord ID.'}, 400
         guild = bot.get_guild(int(guild_id))
         if not guild:
             return {'error': 'Bot is not connected to that server.'}, 404
@@ -85,6 +88,11 @@ def dashboard_member_message_test():
         if not member:
             return {'error': 'The dashboard user is not currently a member of this server.'}, 404
         channel = guild.get_channel(int(channel_id))
+        if not isinstance(channel, discord.TextChannel):
+            return {'error': 'The selected channel is unavailable.'}, 404
+        perms = channel.permissions_for(guild.me) if guild.me else None
+        if not perms or not perms.view_channel or not perms.send_messages or not perms.embed_links:
+            return {'error': 'XGuard does not have permission to send embeds in that channel.'}, 403
         if not channel or not hasattr(channel, 'send'):
             return {'error': 'The selected channel is unavailable.'}, 404
 
@@ -377,11 +385,12 @@ def _member_message_text(value, member):
     # Discord normally provides Guild.member_count. If it has not populated yet
     # (which can briefly happen during the join event), fall back to the cached
     # member list instead of displaying the misleading '#0'.
-    count = guild.member_count
-    if not count:
-        count = len(guild.members)
-    if not count:
-        count = 1 if member in guild.members else 0
+    count = guild.member_count or 0
+    cached = len(guild.members)
+    if cached > count:
+        count = cached
+    if count < 1:
+        count = 1
     return str(value or '').replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', guild.name).replace('{count}', str(count))
 
 async def _download_member_image(url, label):

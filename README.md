@@ -7,6 +7,7 @@ Environment variables:
 - SUPABASE_URL
 - SUPABASE_SERVICE_ROLE_KEY
 - PORT (optional)
+- BOT_API_SECRET
 
 Start command: `python main.py`
 
