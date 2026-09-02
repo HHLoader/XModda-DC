@@ -385,22 +385,46 @@ def _member_message_text(value, member):
     return str(value or '').replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', guild.name).replace('{count}', str(count))
 
 async def _download_member_image(url, label):
+    """Download a complete member image for a Discord embed attachment.
+
+    Some image hosts can close/interrupt a response before aiohttp has received
+    the whole file. In that case, attaching the partial bytes can make Discord
+    render only a small portion of the banner. Retry the download and verify the
+    Content-Length when the host provides one before creating the attachment.
+    """
     url=str(url or '').strip()
     if not url.startswith(('http://','https://')): return None
-    try:
-        timeout=aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                if resp.status != 200: return None
-                content_type=str(resp.headers.get('Content-Type','')).split(';',1)[0].lower()
-                if not content_type.startswith('image/'): return None
-                data=await resp.content.read(8*1024*1024+1)
-                if len(data)>8*1024*1024: return None
-                ext=mimetypes.guess_extension(content_type) or '.png'
-                return discord.File(io.BytesIO(data), filename=f'xmodda-{label}{ext}')
-    except Exception as exc:
-        log.warning('member image download failed: %s', exc)
-        return None
+    timeout=aiohttp.ClientTimeout(total=20, connect=8, sock_read=15)
+    last_error=None
+    for attempt in range(2):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, allow_redirects=True, headers={'Accept':'image/*'}) as resp:
+                    if resp.status != 200:
+                        return None
+                    content_type=str(resp.headers.get('Content-Type','')).split(';',1)[0].lower()
+                    if not content_type.startswith('image/'):
+                        return None
+                    content_length=resp.headers.get('Content-Length')
+                    data=await resp.read()
+                    if not data or len(data)>8*1024*1024:
+                        return None
+                    if content_length:
+                        try:
+                            if len(data) != int(content_length):
+                                raise IOError(f'incomplete image download ({len(data)}/{content_length} bytes)')
+                        except ValueError:
+                            pass
+                    ext=mimetypes.guess_extension(content_type) or '.png'
+                    # Keep a stable, XGuard-owned attachment name.
+                    return discord.File(io.BytesIO(data), filename=f'xguard-{label}{ext}')
+        except Exception as exc:
+            last_error=exc
+            if attempt == 0:
+                await asyncio.sleep(0.35)
+    if last_error:
+        log.warning('member image download failed: %s', last_error)
+    return None
 
 async def _member_embed(settings, member, kind):
     if kind == 'welcome':
