@@ -373,7 +373,16 @@ def _member_color(value, fallback=0x5865F2):
     except Exception: return fallback
 
 def _member_message_text(value, member):
-    return str(value or '').replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', member.guild.name).replace('{count}', str(member.guild.member_count or 0))
+    guild = member.guild
+    # Discord normally provides Guild.member_count. If it has not populated yet
+    # (which can briefly happen during the join event), fall back to the cached
+    # member list instead of displaying the misleading '#0'.
+    count = guild.member_count
+    if not count:
+        count = len(guild.members)
+    if not count:
+        count = 1 if member in guild.members else 0
+    return str(value or '').replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', guild.name).replace('{count}', str(count))
 
 async def _download_member_image(url, label):
     url=str(url or '').strip()
