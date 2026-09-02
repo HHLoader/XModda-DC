@@ -1,4 +1,4 @@
-import os, re, json, asyncio, datetime as dt, logging, threading, html
+import os, re, json, asyncio, datetime as dt, logging, threading
 from collections import defaultdict, deque
 from typing import Optional
 from urllib.parse import urlencode
@@ -37,8 +37,6 @@ DEFAULTS = {
     'ticketPanelDescription': 'Click the button below to open a private support ticket.',
     'ticketOpenedTitle': 'Ticket Created',
     'ticketOpenedDescription': 'Welcome {user}! Please describe your issue.',
-    'ticketOpenedColor': 0x5865F2, 'ticketOpenedThumbnail': '',
-    'ticketPanelThumbnail': '', 'ticketPanelColor': 0x5865F2,
     'disabledCommands': [], 'serverDescription': '',
 }
 
@@ -114,10 +112,6 @@ async def get_settings(guild_id, force=False):
     raw = rows[0].get('settings') if rows else {}
     if not isinstance(raw, dict): raw = {}
     merged = {**DEFAULTS, **raw}
-    if not merged.get('ticketStaffRoleIds') and merged.get('ticketStaffRoleId'):
-        merged['ticketStaffRoleIds'] = [merged['ticketStaffRoleId']]
-    if not merged.get('autoRoleIds') and merged.get('autoRoleId'):
-        merged['autoRoleIds'] = [merged['autoRoleId']]
     settings_cache[guild_id] = merged
     settings_cache_at[guild_id] = now
     return merged
@@ -159,17 +153,9 @@ async def global_command_check(interaction: discord.Interaction):
         pass
     return False
 
-def is_staff(member: discord.Member, settings=None):
+def is_staff(member: discord.Member):
     p = member.guild_permissions
-    if p.administrator or p.manage_guild or p.manage_messages:
-        return True
-    if settings is None:
-        return False
-    role_ids = settings.get('ticketStaffRoleIds') or []
-    if not role_ids and settings.get('ticketStaffRoleId'):
-        role_ids = [settings.get('ticketStaffRoleId')]
-    allowed = {int(x) for x in role_ids if str(x).isdigit()}
-    return any(role.id in allowed for role in member.roles)
+    return p.administrator or p.manage_guild or p.manage_messages
 
 def bypassed(member: discord.Member, settings):
     if member.guild_permissions.administrator or member.guild_permissions.manage_messages:
@@ -305,12 +291,15 @@ async def on_member_join(member):
             text = text.replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', member.guild.name).replace('{count}', str(member.guild.member_count or 0))
             try: await ch.send(text)
             except discord.HTTPException as exc: log.warning('welcome failed: %s', exc)
-    if s.get('autoRole') and s.get('autoRoleId'):
-        role = member.guild.get_role(int(s['autoRoleId'])) if str(s['autoRoleId']).isdigit() else None
-        me = member.guild.me
-        if role and me and role < me.top_role and me.guild_permissions.manage_roles:
-            try: await member.add_roles(role, reason='XModda auto-role')
-            except discord.HTTPException as exc: log.warning('auto-role failed: %s', exc)
+    if s.get('autoRole'):
+        ids=s.get('autoRoleIds') or ([s.get('autoRoleId')] if s.get('autoRoleId') else [])
+        me=member.guild.me
+        if me and me.guild_permissions.manage_roles:
+            for rid in ids:
+                role=member.guild.get_role(int(rid)) if str(rid).isdigit() else None
+                if role and role < me.top_role:
+                    try: await member.add_roles(role, reason='XModda auto-role')
+                    except discord.HTTPException as exc: log.warning('auto-role failed for %s: %s',role.name,exc)
     if s.get('raid'):
         now = asyncio.get_running_loop().time(); h = join_history[member.guild.id]; h.append(now)
         window = max(1, int(s.get('raidWindow', 10) or 10)); limit = max(2, int(s.get('raidJoinLimit', 8) or 8))
@@ -472,7 +461,7 @@ async def goodbye_disable(i): await save_settings(i.guild.id,{'goodbye':False});
 @app_commands.checks.has_permissions(manage_roles=True)
 async def autorole(i, role: discord.Role):
     if i.guild.me and role >= i.guild.me.top_role: return await i.response.send_message(embed=err("That role must be below XModda's highest role."),ephemeral=True)
-    try: await save_settings(i.guild.id,{'autoRole':True,'autoRoleId':role.id,'autoRoleIds':[role.id]})
+    try: await save_settings(i.guild.id,{'autoRole':True,'autoRoleId':role.id})
     except Exception as ex: return await i.response.send_message(embed=err(f'Could not save auto-role settings: {ex}'),ephemeral=True)
     await i.response.send_message(f'✅ Auto-role enabled: {role.mention}',ephemeral=True)
 
@@ -492,75 +481,26 @@ async def logging_config(i, channel: discord.TextChannel):
 async def logging_disable(i): await save_settings(i.guild.id,{'logging':False}); await i.response.send_message('✅ Logging disabled.',ephemeral=True)
 
 # ---------------- Tickets ----------------
-def _id_list(settings, plural_key, single_key):
-    values = settings.get(plural_key) or []
-    if not values and settings.get(single_key):
-        values = [settings.get(single_key)]
-    return [int(x) for x in values if str(x).isdigit()]
-
-def _ticket_staff_roles(guild, settings):
-    result = []
-    for rid in _id_list(settings, 'ticketStaffRoleIds', 'ticketStaffRoleId'):
-        role = guild.get_role(rid)
-        if role:
-            result.append(role)
-    return result
-
-def _ticket_log_channel(guild, settings):
-    cid = settings.get('ticketLogChannelId') or settings.get('logChannelId')
-    return guild.get_channel(int(cid)) if cid and str(cid).isdigit() else None
-
-def _ticket_text(value, member, guild):
-    return str(value or '').replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', guild.name).replace('{count}', str(guild.member_count or 0))
-
 async def open_ticket(i):
-    g = i.guild
-    if not g or not isinstance(i.user, discord.Member):
-        return await i.response.send_message('❌ Tickets can only be opened inside a server.', ephemeral=True)
+    g=i.guild
+    try: s=await get_settings(g.id,True)
+    except Exception as ex: return await i.response.send_message(embed=err(f'Database error: {ex}'),ephemeral=True)
+    if not s.get('tickets',True): return await i.response.send_message('❌ Tickets are currently disabled.',ephemeral=True)
+    category=g.get_channel(int(s['ticketCategoryId'])) if str(s.get('ticketCategoryId','')).isdigit() else None
+    staff_ids=s.get('ticketStaffRoleIds') or ([s.get('ticketStaffRoleId')] if s.get('ticketStaffRoleId') else [])
+    staff_roles=[g.get_role(int(rid)) for rid in staff_ids if str(rid).isdigit()]
+    staff_roles=[r for r in staff_roles if r is not None]
+    if not isinstance(category,discord.CategoryChannel) or not staff_roles: return await i.response.send_message('❌ Tickets are not configured yet. Choose a category and at least one staff role in the dashboard.',ephemeral=True)
+    existing=[c for c in category.channels if isinstance(c,discord.TextChannel) and c.topic==f'xmodda-ticket:{i.user.id}']
+    limit=max(1,int(s.get('ticketLimit',1) or 1))
+    if len(existing)>=limit: return await i.response.send_message(f'❌ You already have the maximum of {limit} open ticket(s).',ephemeral=True)
+    ow={g.default_role:discord.PermissionOverwrite(view_channel=False),i.user:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True),g.me:discord.PermissionOverwrite(view_channel=True,send_messages=True,manage_channels=True,read_message_history=True),**{r:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True) for r in staff_roles}}
     try:
-        s = await get_settings(g.id, True)
-    except Exception as ex:
-        return await i.response.send_message(embed=err(f'Database error: {ex}'), ephemeral=True)
-    if not s.get('tickets', True):
-        return await i.response.send_message('❌ Tickets are currently disabled.', ephemeral=True)
-    category = g.get_channel(int(s['ticketCategoryId'])) if str(s.get('ticketCategoryId', '')).isdigit() else None
-    staff_roles = _ticket_staff_roles(g, s)
-    if not isinstance(category, discord.CategoryChannel) or not staff_roles:
-        return await i.response.send_message('❌ Tickets are not configured yet. Choose a category and at least one staff role in the dashboard.', ephemeral=True)
-    existing = [c for c in category.channels if isinstance(c, discord.TextChannel) and c.topic == f'xmodda-ticket:{i.user.id}']
-    limit = max(1, int(s.get('ticketLimit', 1) or 1))
-    if len(existing) >= limit:
-        return await i.response.send_message(f'❌ You already have the maximum of {limit} open ticket(s).', ephemeral=True)
-    overwrites = {g.default_role: discord.PermissionOverwrite(view_channel=False),
-                  i.user: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)}
-    if g.me:
-        overwrites[g.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, read_message_history=True)
-    for role in staff_roles:
-        overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-    safe_name = re.sub(r'[^a-z0-9-]+', '-', i.user.name.lower()).strip('-')[:70] or 'user'
-    try:
-        ch = await g.create_text_channel(f'ticket-{safe_name}'[:95], category=category, overwrites=overwrites,
-                                         topic=f'xmodda-ticket:{i.user.id}', reason='XModda ticket opened')
-        embed = discord.Embed(title=str(s.get('ticketOpenedTitle') or 'Ticket Created'),
-            description=_ticket_text(s.get('ticketOpenedDescription') or 'Welcome {user}! Please describe your issue.', i.user, g),
-            color=int(s.get('ticketOpenedColor', 0x5865F2) or 0x5865F2), timestamp=dt.datetime.now(dt.timezone.utc))
-        embed.set_footer(text=f'Ticket ID: {ch.id}')
-        thumb = str(s.get('ticketOpenedThumbnail') or '').strip()
-        if thumb: embed.set_thumbnail(url=thumb)
-        embed.add_field(name='Status', value='🟢 Open', inline=True)
-        embed.add_field(name='Opened by', value=i.user.mention, inline=True)
-        await ch.send(embed=embed, view=TicketManageView())
-        await i.response.send_message(f'✅ Ticket created: {ch.mention}', ephemeral=True)
-        logch = _ticket_log_channel(g, s)
-        if logch:
-            await logch.send(embed=discord.Embed(title='🎫 Ticket Opened', description=f'{i.user.mention} opened {ch.mention}.',
-                                                 color=0x5865F2, timestamp=dt.datetime.now(dt.timezone.utc)))
-    except discord.HTTPException as ex:
-        try:
-            if 'ch' in locals(): await ch.delete(reason='XModda ticket setup failed')
-        except Exception: pass
-        if not i.response.is_done():
-            await i.response.send_message(embed=err(f'Could not create the ticket: {ex}'), ephemeral=True)
+        ch=await g.create_text_channel(f'ticket-{i.user.name}'[:95],category=category,overwrites=ow,topic=f'xmodda-ticket:{i.user.id}',reason='XModda ticket opened')
+        title=str(s.get('ticketOpenedTitle') or 'Ticket Created'); desc=str(s.get('ticketOpenedDescription') or '').replace('{user}',i.user.mention).replace('{username}',i.user.name).replace('{server}',g.name)
+        await ch.send(embed=discord.Embed(title=title,description=desc,color=0x5865F2),view=TicketManageView())
+    except discord.HTTPException as ex: return await i.response.send_message(embed=err(f'Could not create the ticket: {ex}'),ephemeral=True)
+    await i.response.send_message(f'✅ Ticket created: {ch.mention}',ephemeral=True); await send_log(g,'Ticket opened',f'{i.user.mention} opened {ch.mention}',0x5865F2,'ticket')
 
 class TicketPanelView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
@@ -571,143 +511,71 @@ class TicketManageView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
     @discord.ui.button(label='Claim', style=discord.ButtonStyle.success, emoji='🙋', custom_id='xmodda:ticket_claim')
     async def claim(self, i, button):
-        if not isinstance(i.user, discord.Member): return await i.response.send_message('❌ Staff only.', ephemeral=True)
-        try: s = await get_settings(i.guild.id, True)
-        except Exception as ex: return await i.response.send_message(embed=err(f'Database error: {ex}'), ephemeral=True)
-        if not is_staff(i.user, s): return await i.response.send_message('❌ Staff only.', ephemeral=True)
-        if not isinstance(i.channel, discord.TextChannel) or not (i.channel.topic or '').startswith('xmodda-ticket:'):
-            return await i.response.send_message('❌ This is not an XModda ticket.', ephemeral=True)
-        ticket_claims[i.channel.id] = i.user.id
-        button.disabled = True
-        button.label = f'Claimed by {i.user.display_name}'[:80]
-        try: await i.message.edit(view=self)
-        except discord.HTTPException: pass
-        await i.response.send_message(f'🙋 Ticket claimed by {i.user.mention}.')
-        try:
-            async for msg in i.channel.history(limit=20, oldest_first=True):
-                if msg.author == bot.user and msg.embeds:
-                    em = msg.embeds[0]
-                    if not any(f.name == 'Claimed by' for f in em.fields):
-                        em.add_field(name='Claimed by', value=i.user.mention, inline=False)
-                        await msg.edit(embed=em)
-                    break
-        except discord.HTTPException: pass
+        if not isinstance(i.user,discord.Member) or not is_staff(i.user): return await i.response.send_message('❌ Staff only.',ephemeral=True)
+        ticket_claims[i.channel.id]=i.user.id; button.disabled=True; button.label=f'Claimed by {i.user.display_name}'[:80]; await i.message.edit(view=self); await i.response.send_message(f'🙋 Claimed by {i.user.mention}.',ephemeral=False)
     @discord.ui.button(label='Close Ticket', style=discord.ButtonStyle.danger, emoji='🔒', custom_id='xmodda:ticket_close')
     async def close(self, i, button):
-        if not isinstance(i.user, discord.Member): return await i.response.send_message('❌ You cannot close this ticket.', ephemeral=True)
-        try: s = await get_settings(i.guild.id, True)
-        except Exception as ex: return await i.response.send_message(embed=err(f'Database error: {ex}'), ephemeral=True)
-        owner_id = (i.channel.topic or '').replace('xmodda-ticket:', '', 1) if i.channel else ''
-        if not (is_staff(i.user, s) or str(i.user.id) == owner_id):
-            return await i.response.send_message('❌ You cannot close this ticket.', ephemeral=True)
-        await i.response.send_message('🔒 Closing ticket in 5 seconds...', ephemeral=True)
-        try:
-            countdown = await i.channel.send('🔒 Closing ticket in **5** seconds...')
-            for remaining in range(4, 0, -1):
-                await asyncio.sleep(1)
-                await countdown.edit(content=f'🔒 Closing ticket in **{remaining}** seconds...')
-            await save_transcript(i.channel, i.guild, s, i.user)
-            logch = _ticket_log_channel(i.guild, s)
-            if logch:
-                await logch.send(embed=discord.Embed(title='🔒 Ticket Closed', description=f'{i.channel.mention} was closed by {i.user.mention}',
-                                                     color=0xED4245, timestamp=dt.datetime.now(dt.timezone.utc)))
-            await i.channel.delete(reason='XModda ticket closed')
-        except discord.HTTPException as ex:
-            try: await i.channel.send(f'❌ Could not close this ticket: `{ex}`')
-            except Exception: pass
-
-class LegacyTicketPanelView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label='Create Ticket', style=discord.ButtonStyle.success, emoji='🎫', custom_id='create_ticket')
-    async def create_button(self, i, button): await open_ticket(i)
-
-class LegacyTicketManageView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=None)
-    @discord.ui.button(label='Claim', style=discord.ButtonStyle.primary, custom_id='claim_ticket')
-    async def claim_button(self, i, button): await TicketManageView.claim(self, i, button)
-    @discord.ui.button(label='Close Ticket', style=discord.ButtonStyle.danger, custom_id='close_ticket')
-    async def close_button(self, i, button): await TicketManageView.close(self, i, button)
-
-async def save_transcript(channel, guild, settings, closer=None):
-    logch = _ticket_log_channel(guild, settings)
-    if not logch: return
-    lines = []
-    try:
-        async for message in channel.history(limit=None, oldest_first=True):
-            stamp = message.created_at.strftime('%Y-%m-%d %H:%M:%S UTC')
-            author = f'{message.author} ({message.author.id})'
-            content = message.content or ''
-            if message.attachments:
-                content += (' ' if content else '') + 'Attachments: ' + ', '.join(a.url for a in message.attachments)
-            if message.embeds and not content: content = '[Embed]'
-            if not content: content = '[No text]'
-            lines.append((stamp, author, content))
-    except discord.HTTPException:
-        lines.append(('unknown', 'system', '[Unable to read the complete channel history.]'))
-    safe = re.sub(r'[^a-zA-Z0-9._-]+', '-', channel.name)
-    filename = f'transcript-{safe}-{channel.id}.html'
-    rows = ''.join('<div class="message"><span class="time">[' + html.escape(stamp) + ']</span> <b>' +
-                   html.escape(author) + '</b>: ' + html.escape(content) + '</div>' for stamp, author, content in lines)
-    doc = ('<!doctype html><html><head><meta charset="utf-8"><title>Ticket Transcript - ' + html.escape(channel.name) +
-           '</title><style>body{font-family:Arial,sans-serif;background:#111;color:#eee;padding:24px}h1{margin:0 0 8px}.meta{color:#aaa;margin-bottom:18px}.message{padding:8px 0;border-bottom:1px solid #2b2b2b;white-space:pre-wrap}.time{color:#888}</style></head><body><h1>Ticket Transcript</h1>' +
-           '<div class="meta">Channel: ' + html.escape(channel.name) + ' · Server: ' + html.escape(guild.name) +
-           ' · Closed by: ' + html.escape(str(closer) if closer else 'Unknown') + '</div>' + rows + '</body></html>')
-    try:
-        with open(filename, 'w', encoding='utf-8') as f: f.write(doc)
-        await logch.send(content=f'📄 Transcript for **{channel.name}**', file=discord.File(filename))
-    finally:
-        try: os.remove(filename)
-        except OSError: pass
+        if not isinstance(i.user,discord.Member) or not (is_staff(i.user) or (i.channel.topic or '')==f'xmodda-ticket:{i.user.id}'): return await i.response.send_message('❌ You cannot close this ticket.',ephemeral=True)
+        await i.response.send_message('🔒 Closing ticket...',ephemeral=True); await send_log(i.guild,'Ticket closed',f'{i.channel.mention} closed by {i.user.mention}',0x5865F2,'ticket'); await asyncio.sleep(1)
+        try: await i.channel.delete(reason='XModda ticket closed')
+        except discord.HTTPException: pass
 
 @bot.tree.command(name='ticket_config', description='Configure ticket category and staff role')
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ticket_config(i, category: discord.CategoryChannel, staff_role: discord.Role):
-    try:
-        await save_settings(i.guild.id, {'tickets': True, 'ticketCategoryId': category.id, 'ticketStaffRoleId': staff_role.id, 'ticketStaffRoleIds': [staff_role.id]})
-    except Exception as ex: return await i.response.send_message(embed=err(f'Could not save ticket settings: {ex}'), ephemeral=True)
-    await i.response.send_message(f'✅ Tickets configured. Category: **{category.name}** | Staff: {staff_role.mention}', ephemeral=True)
+    try: await save_settings(i.guild.id,{'tickets':True,'ticketCategoryId':category.id,'ticketStaffRoleId':staff_role.id,'ticketStaffRoleIds':[staff_role.id]})
+    except Exception as ex: return await i.response.send_message(embed=err(f'Could not save ticket settings: {ex}'),ephemeral=True)
+    await i.response.send_message(f'✅ Tickets configured. Category: **{category.name}** | Staff: {staff_role.mention}',ephemeral=True)
 
 async def send_ticket_panel_to(guild, channel, settings):
-    if not isinstance(channel, discord.TextChannel): raise RuntimeError('Panel channel is not a text channel.')
-    if not settings.get('ticketCategoryId') or not _id_list(settings, 'ticketStaffRoleIds', 'ticketStaffRoleId'):
-        raise RuntimeError('Choose a ticket category and at least one staff role first.')
-    embed = discord.Embed(title=str(settings.get('ticketPanelTitle') or 'Support Tickets'),
-                          description=str(settings.get('ticketPanelDescription') or 'Click the button below to open a private support ticket.'),
-                          color=int(settings.get('ticketPanelColor', 0x5865F2) or 0x5865F2))
-    thumb = str(settings.get('ticketPanelThumbnail') or '').strip()
-    if thumb: embed.set_thumbnail(url=thumb)
-    return await channel.send(embed=embed, view=TicketPanelView())
+    if not isinstance(channel,discord.TextChannel): raise RuntimeError('Panel channel is not a text channel.')
+    if not settings.get('ticketCategoryId') or not (settings.get('ticketStaffRoleIds') or settings.get('ticketStaffRoleId')): raise RuntimeError('Choose a ticket category and staff role first.')
+    embed=discord.Embed(title=str(settings.get('ticketPanelTitle') or 'Support Tickets'),description=str(settings.get('ticketPanelDescription') or ''),color=0x5865F2)
+    return await channel.send(embed=embed,view=TicketPanelView())
 
 @bot.tree.command(name='ticket_panel', description='Post a ticket panel in this channel')
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ticket_panel(i):
     try:
-        s = await get_settings(i.guild.id, True)
-        msg = await send_ticket_panel_to(i.guild, i.channel, s)
-        await i.response.send_message(f'✅ Ticket panel sent: {msg.jump_url}', ephemeral=True)
-    except Exception as ex: await i.response.send_message(embed=err(str(ex)), ephemeral=True)
+        s=await get_settings(i.guild.id,True); msg=await send_ticket_panel_to(i.guild,i.channel,s); await i.response.send_message(f'✅ Ticket panel sent: {msg.jump_url}',ephemeral=True)
+    except Exception as ex: await i.response.send_message(embed=err(str(ex)),ephemeral=True)
 
-@bot.tree.command(name='ticket_setup', description='Post the configured ticket panel')
-@app_commands.checks.has_permissions(manage_guild=True)
-async def ticket_setup(i):
-    try:
-        s = await get_settings(i.guild.id, True)
-        cid = s.get('ticketPanelChannelId') or i.channel.id
-        ch = i.guild.get_channel(int(cid)) if str(cid).isdigit() else i.channel
-        msg = await send_ticket_panel_to(i.guild, ch, s)
-        await i.response.send_message(f'✅ Ticket panel sent to {ch.mention}: {msg.jump_url}', ephemeral=True)
-    except Exception as ex: await i.response.send_message(embed=err(str(ex)), ephemeral=True)
-
-@bot.tree.command(name='ticket_send', description='Send the configured ticket panel to the selected dashboard channel')
+@bot.tree.command(name='ticket_send', description='Send the configured ticket panel to the configured channel')
 @app_commands.checks.has_permissions(manage_guild=True)
 async def ticket_send(i):
     try:
-        s = await get_settings(i.guild.id, True)
-        cid = s.get('ticketPanelChannelId') or i.channel.id
-        ch = i.guild.get_channel(int(cid)) if str(cid).isdigit() else i.channel
-        msg = await send_ticket_panel_to(i.guild, ch, s)
-        await i.response.send_message(f'✅ Ticket panel sent to {ch.mention}: {msg.jump_url}', ephemeral=True)
-    except Exception as ex: await i.response.send_message(embed=err(str(ex)), ephemeral=True)
+        s=await get_settings(i.guild.id,True); cid=s.get('ticketPanelChannelId') or i.channel.id; ch=i.guild.get_channel(int(cid)) if str(cid).isdigit() else None; msg=await send_ticket_panel_to(i.guild,ch,s); await i.response.send_message(f'✅ Ticket panel sent to {ch.mention}: {msg.jump_url}',ephemeral=True); await send_log(i.guild,'Ticket panel sent',f'{i.user.mention} sent a ticket panel to {ch.mention}.',0x5865F2,'ticket')
+    except Exception as ex: await i.response.send_message(embed=err(str(ex)),ephemeral=True)
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    """Fallback handler for ticket buttons sent by the dashboard.
+
+    This deliberately handles the panel's custom IDs even if a message was
+    created by the website/API rather than by this bot process. That prevents
+    old or externally-created ticket panels from timing out when the persistent
+    View registry was rebuilt after a restart.
+    """
+    try:
+        if interaction.type is not discord.InteractionType.component:
+            return
+        data = interaction.data or {}
+        custom_id = str(data.get('custom_id') or '')
+        if custom_id not in {'xmodda:ticket_open', 'xmodda_ticket_open_v3'}:
+            return
+        if interaction.response.is_done():
+            return
+        await open_ticket(interaction)
+    except Exception as ex:
+        log.exception('Ticket component fallback failed')
+        try:
+            msg = f'❌ Ticket button failed: {str(ex)[:800]}'
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
 @bot.tree.error
 async def on_app_command_error(i,error):
@@ -725,8 +593,6 @@ async def setup_hook():
     # Register persistent views after the Discord client is initialized.
     bot.add_view(TicketPanelView())
     bot.add_view(TicketManageView())
-    bot.add_view(LegacyTicketPanelView())
-    bot.add_view(LegacyTicketManageView())
     log.info('Persistent ticket views registered.')
 
 bot.setup_hook = setup_hook
