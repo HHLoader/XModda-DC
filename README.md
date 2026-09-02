@@ -19,3 +19,7 @@ Required bot permissions depend on enabled features; for the full build use View
 Diagnostics: `/xmodda_diag`
 AutoMod status: `/automod_status`
 Reload settings: `/automod_reload`
+
+
+### Member embeds
+The dashboard's Welcome and Goodbye builders are rendered as real Discord embeds. `Thumbnail URL` is the small upper-right embed image, `Image URL` is the large bottom embed image, `Embed color` controls the embed accent, and `Footer text` uses Discord's actual embed footer.

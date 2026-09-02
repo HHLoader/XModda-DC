@@ -29,8 +29,12 @@ DEFAULTS = {
     'ignoredChannels': [], 'bypassRoles': [], 'logging': False, 'logChannelId': '',
     'logModeration': True, 'logAutoMod': True, 'logJoins': False, 'logLeaves': False,
     'welcome': False, 'welcomeChannelId': '',
+    'welcomeTitle': '👋 Welcome to {server}!',
     'welcomeMessage': 'Welcome {user} to **{server}**! You are member #{count}.',
-    'goodbye': False, 'goodbyeChannelId': '', 'goodbyeMessage': '**{username}** has left {server}.',
+    'welcomeEmbedColor': '#5865F2', 'welcomeThumbnail': '', 'welcomeImage': '', 'welcomeFooter': '',
+    'goodbye': False, 'goodbyeChannelId': '', 'goodbyeTitle': '👋 Goodbye!',
+    'goodbyeMessage': '**{username}** has left {server}.',
+    'goodbyeEmbedColor': '#ED4245', 'goodbyeThumbnail': '', 'goodbyeImage': '', 'goodbyeFooter': '',
     'autoRole': False, 'autoRoleId': '', 'autoRoleIds': [], 'tickets': True, 'ticketCategoryId': '',
     'ticketStaffRoleId': '', 'ticketStaffRoleIds': [], 'ticketLogChannelId': '', 'ticketPanelChannelId': '',
     'ticketLimit': 1, 'ticketPanelTitle': 'Support Tickets',
@@ -326,6 +330,36 @@ async def on_message(message):
         await run_automations(message.guild,'message',message=message,member=message.author)
     await bot.process_commands(message)
 
+def _member_color(value, fallback=0x5865F2):
+    try: return int(str(value).replace('#',''),16)
+    except Exception: return fallback
+
+def _member_message_text(value, member):
+    return str(value or '').replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', member.guild.name).replace('{count}', str(member.guild.member_count or 0))
+
+def _member_embed(settings, member, kind):
+    if kind == 'welcome':
+        title = _member_message_text(settings.get('welcomeTitle') or DEFAULTS['welcomeTitle'], member)
+        description = _member_message_text(settings.get('welcomeMessage') or DEFAULTS['welcomeMessage'], member)
+        color = _member_color(settings.get('welcomeEmbedColor') or DEFAULTS['welcomeEmbedColor'], 0x5865F2)
+        thumbnail = settings.get('welcomeThumbnail')
+        image = settings.get('welcomeImage')
+        footer = _member_message_text(settings.get('welcomeFooter') or '', member)
+    else:
+        title = _member_message_text(settings.get('goodbyeTitle') or DEFAULTS['goodbyeTitle'], member)
+        description = _member_message_text(settings.get('goodbyeMessage') or DEFAULTS['goodbyeMessage'], member)
+        color = _member_color(settings.get('goodbyeEmbedColor') or DEFAULTS['goodbyeEmbedColor'], 0xED4245)
+        thumbnail = settings.get('goodbyeThumbnail')
+        image = settings.get('goodbyeImage')
+        footer = _member_message_text(settings.get('goodbyeFooter') or '', member)
+    embed = discord.Embed(color=color)
+    if title.strip(): embed.title = title
+    if description.strip(): embed.description = description
+    if thumbnail and str(thumbnail).strip().startswith(('http://','https://')): embed.set_thumbnail(url=str(thumbnail).strip())
+    if image and str(image).strip().startswith(('http://','https://')): embed.set_image(url=str(image).strip())
+    if footer.strip(): embed.set_footer(text=footer)
+    return embed
+
 @bot.event
 async def on_member_join(member):
     try:
@@ -335,9 +369,7 @@ async def on_member_join(member):
     if s.get('welcome') and s.get('welcomeChannelId'):
         ch = member.guild.get_channel(int(s['welcomeChannelId'])) if str(s['welcomeChannelId']).isdigit() else None
         if ch:
-            text = str(s.get('welcomeMessage') or DEFAULTS['welcomeMessage'])
-            text = text.replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', member.guild.name).replace('{count}', str(member.guild.member_count or 0))
-            try: await ch.send(text)
+            try: await ch.send(embed=_member_embed(s, member, 'welcome'))
             except discord.HTTPException as exc: log.warning('welcome failed: %s', exc)
     if s.get('autoRole'):
         ids=s.get('autoRoleIds') or ([s.get('autoRoleId')] if s.get('autoRoleId') else [])
@@ -364,8 +396,7 @@ async def on_member_remove(member):
     if s.get('goodbye') and s.get('goodbyeChannelId'):
         ch = member.guild.get_channel(int(s['goodbyeChannelId'])) if str(s['goodbyeChannelId']).isdigit() else None
         if ch:
-            text = str(s.get('goodbyeMessage') or DEFAULTS['goodbyeMessage']).replace('{username}', member.name).replace('{server}', member.guild.name)
-            try: await ch.send(text)
+            try: await ch.send(embed=_member_embed(s, member, 'goodbye'))
             except discord.HTTPException as exc: log.warning('goodbye failed: %s', exc)
     await run_automations(member.guild,'member_leave',member=member)
     await send_log(member.guild, 'Member left', f'**Member:** {member} (`{member.id}`)', 0xED4245, 'leave')
