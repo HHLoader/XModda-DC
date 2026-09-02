@@ -1,4 +1,4 @@
-import os, re, json, asyncio, datetime as dt, logging, threading
+import os, re, json, asyncio, datetime as dt, logging, threading, io, mimetypes
 from collections import defaultdict, deque
 from typing import Optional
 from urllib.parse import urlencode
@@ -6,6 +6,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 import discord
+import aiohttp
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask
@@ -337,7 +338,25 @@ def _member_color(value, fallback=0x5865F2):
 def _member_message_text(value, member):
     return str(value or '').replace('{user}', member.mention).replace('{username}', member.name).replace('{server}', member.guild.name).replace('{count}', str(member.guild.member_count or 0))
 
-def _member_embed(settings, member, kind):
+async def _download_member_image(url, label):
+    url=str(url or '').strip()
+    if not url.startswith(('http://','https://')): return None
+    try:
+        timeout=aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status != 200: return None
+                content_type=str(resp.headers.get('Content-Type','')).split(';',1)[0].lower()
+                if not content_type.startswith('image/'): return None
+                data=await resp.content.read(8*1024*1024+1)
+                if len(data)>8*1024*1024: return None
+                ext=mimetypes.guess_extension(content_type) or '.png'
+                return discord.File(io.BytesIO(data), filename=f'xmodda-{label}{ext}')
+    except Exception as exc:
+        log.warning('member image download failed: %s', exc)
+        return None
+
+async def _member_embed(settings, member, kind):
     if kind == 'welcome':
         title = _member_message_text(settings.get('welcomeTitle') or DEFAULTS['welcomeTitle'], member)
         description = _member_message_text(settings.get('welcomeMessage') or DEFAULTS['welcomeMessage'], member)
@@ -355,10 +374,23 @@ def _member_embed(settings, member, kind):
     embed = discord.Embed(color=color)
     if title.strip(): embed.title = title
     if description.strip(): embed.description = description
-    if thumbnail and str(thumbnail).strip().startswith(('http://','https://')): embed.set_thumbnail(url=str(thumbnail).strip())
-    if image and str(image).strip().startswith(('http://','https://')): embed.set_image(url=str(image).strip())
-    if footer.strip(): embed.set_footer(text=footer)
-    return embed
+    files=[]
+    thumb_file=await _download_member_image(thumbnail, f'{kind}-thumb')
+    image_file=await _download_member_image(image, f'{kind}-image')
+    if thumb_file:
+        embed.set_thumbnail(url=f'attachment://{thumb_file.filename}'); files.append(thumb_file)
+    elif thumbnail and str(thumbnail).strip().startswith(('http://','https://')):
+        embed.set_thumbnail(url=str(thumbnail).strip())
+    if image_file:
+        embed.set_image(url=f'attachment://{image_file.filename}'); files.append(image_file)
+    elif image and str(image).strip().startswith(('http://','https://')):
+        embed.set_image(url=str(image).strip())
+    if footer.strip():
+        if member.guild.icon:
+            embed.set_footer(text=footer, icon_url=member.guild.icon.url)
+        else:
+            embed.set_footer(text=footer)
+    return embed, files
 
 @bot.event
 async def on_member_join(member):
@@ -369,7 +401,7 @@ async def on_member_join(member):
     if s.get('welcome') and s.get('welcomeChannelId'):
         ch = member.guild.get_channel(int(s['welcomeChannelId'])) if str(s['welcomeChannelId']).isdigit() else None
         if ch:
-            try: await ch.send(embed=_member_embed(s, member, 'welcome'))
+            try: embed, files = await _member_embed(s, member, 'welcome'); await ch.send(embed=embed, files=files)
             except discord.HTTPException as exc: log.warning('welcome failed: %s', exc)
     if s.get('autoRole'):
         ids=s.get('autoRoleIds') or ([s.get('autoRoleId')] if s.get('autoRoleId') else [])
@@ -396,7 +428,7 @@ async def on_member_remove(member):
     if s.get('goodbye') and s.get('goodbyeChannelId'):
         ch = member.guild.get_channel(int(s['goodbyeChannelId'])) if str(s['goodbyeChannelId']).isdigit() else None
         if ch:
-            try: await ch.send(embed=_member_embed(s, member, 'goodbye'))
+            try: embed, files = await _member_embed(s, member, 'goodbye'); await ch.send(embed=embed, files=files)
             except discord.HTTPException as exc: log.warning('goodbye failed: %s', exc)
     await run_automations(member.guild,'member_leave',member=member)
     await send_log(member.guild, 'Member left', f'**Member:** {member} (`{member.id}`)', 0xED4245, 'leave')
