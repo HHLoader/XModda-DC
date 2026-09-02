@@ -5,8 +5,6 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
 import discord
 import aiohttp
 from discord import app_commands
@@ -34,10 +32,10 @@ DEFAULTS = {
     'welcome': False, 'welcomeChannelId': '',
     'welcomeTitle': '👋 Welcome to {server}!',
     'welcomeMessage': 'Welcome {user} to **{server}**! You are member #{count}.',
-    'welcomeEmbedColor': '#5865F2', 'welcomeThumbnail': '', 'welcomeImage': '', 'welcomeFooter': '', 'welcomeDynamicBanner': True,
+    'welcomeEmbedColor': '#5865F2', 'welcomeThumbnail': '', 'welcomeImage': '', 'welcomeFooter': '',
     'goodbye': False, 'goodbyeChannelId': '', 'goodbyeTitle': '👋 Goodbye!',
     'goodbyeMessage': '**{username}** has left {server}.',
-    'goodbyeEmbedColor': '#ED4245', 'goodbyeThumbnail': '', 'goodbyeImage': '', 'goodbyeFooter': '', 'goodbyeDynamicBanner': True,
+    'goodbyeEmbedColor': '#ED4245', 'goodbyeThumbnail': '', 'goodbyeImage': '', 'goodbyeFooter': '',
     'autoRole': False, 'autoRoleId': '', 'autoRoleIds': [], 'tickets': True, 'ticketCategoryId': '',
     'ticketStaffRoleId': '', 'ticketStaffRoleIds': [], 'ticketLogChannelId': '', 'ticketPanelChannelId': '',
     'ticketLimit': 1, 'ticketPanelTitle': 'Support Tickets',
@@ -49,129 +47,6 @@ DEFAULTS = {
 
 URL_RE = re.compile(r'(?:https?://|www\.)\S+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|gg|io|co|me|tv|dev|xyz|info|site|online|app|ly|us|uk|ca)\b', re.I)
 INVITE_RE = re.compile(r'(?:https?://)?(?:www\.)?(?:discord\.gg|discord(?:app)?\.com/invite)/[A-Za-z0-9-]+', re.I)
-
-# ---------------- Dynamic welcome/goodbye banners ----------------
-BOT_DIR = os.path.dirname(os.path.abspath(__file__))
-BANNER_DIR = os.path.join(BOT_DIR, 'assets')
-WELCOME_BANNER_PATH = os.path.join(BANNER_DIR, 'welcome.png')
-GOODBYE_BANNER_PATH = os.path.join(BANNER_DIR, 'goodbye.png')
-BANNER_SIZE = (1983, 793)
-AVATAR_CENTER = (842, 454)
-AVATAR_SIZE = 92
-NAME_CENTER_X = 842
-NAME_Y = 532
-NAME_MAX_WIDTH = 700
-
-
-def _font(size):
-    candidates = [
-        os.path.join(BOT_DIR, 'assets', 'DejaVuSans-Bold.ttf'),
-        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-        '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',
-        'C:/Windows/Fonts/arialbd.ttf',
-    ]
-    for candidate in candidates:
-        try:
-            if os.path.exists(candidate):
-                return ImageFont.truetype(candidate, size=size)
-        except Exception:
-            pass
-    return ImageFont.load_default()
-
-
-def _fit_name_font(draw, name):
-    size = 42
-    while size > 22:
-        f = _font(size)
-        box = draw.textbbox((0, 0), name, font=f)
-        if box[2] - box[0] <= NAME_MAX_WIDTH:
-            return f
-        size -= 1
-    return _font(22)
-
-
-async def _download_avatar_url(url):
-    url = str(url or '').strip()
-    if not url.startswith(('http://','https://')):
-        raise RuntimeError('Missing member avatar URL')
-    timeout = aiohttp.ClientTimeout(total=8)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        headers = {'User-Agent': 'XGuard/1.0', 'Accept': 'image/avif,image/webp,image/apng,image/png,image/*,*/*;q=0.8'}
-        async with session.get(url, headers=headers, allow_redirects=True) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f'Discord avatar HTTP {resp.status}')
-            data = await resp.content.read(4 * 1024 * 1024 + 1)
-            if len(data) > 4 * 1024 * 1024:
-                raise RuntimeError('Discord avatar is too large')
-            return data
-
-async def _download_member_avatar(member):
-    # discord.py already knows how to retrieve Discord CDN assets. Using Asset.read()
-    # avoids Render/CDN content-type and WebP handling differences from raw HTTP.
-    try:
-        return await member.display_avatar.read()
-    except Exception as exc:
-        log.warning('discord.py avatar read failed: %s', exc)
-        url = str(member.display_avatar.replace(size=256).url)
-        return await _download_avatar_url(url + ('&format=png' if '?' in url else '?format=png'))
-
-async def _dynamic_member_banner_identity(avatar_bytes, display_name, kind, filename_id='preview'):
-    template_path = WELCOME_BANNER_PATH if kind == 'welcome' else GOODBYE_BANNER_PATH
-    if not os.path.exists(template_path):
-        raise RuntimeError(f'Missing dynamic banner template: {template_path}')
-
-    if not avatar_bytes:
-        raise RuntimeError('Member avatar data is empty')
-    base = Image.open(template_path).convert('RGBA')
-    if base.size != BANNER_SIZE:
-        base = base.resize(BANNER_SIZE, Image.Resampling.LANCZOS)
-
-    avatar = Image.open(io.BytesIO(avatar_bytes)).convert('RGBA')
-    avatar.thumbnail((AVATAR_SIZE, AVATAR_SIZE), Image.Resampling.LANCZOS)
-    circle = Image.new('L', (AVATAR_SIZE, AVATAR_SIZE), 0)
-    ImageDraw.Draw(circle).ellipse((0, 0, AVATAR_SIZE - 1, AVATAR_SIZE - 1), fill=255)
-    avatar_canvas = Image.new('RGBA', (AVATAR_SIZE, AVATAR_SIZE), (0, 0, 0, 0))
-    ax = (AVATAR_SIZE - avatar.width) // 2
-    ay = (AVATAR_SIZE - avatar.height) // 2
-    avatar_canvas.paste(avatar, (ax, ay), avatar)
-    avatar_canvas.putalpha(circle)
-
-    cx, cy = AVATAR_CENTER
-    glow = Image.new('RGBA', base.size, (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    gd.ellipse((cx - 50, cy - 50, cx + 50, cy + 50), fill=(83, 43, 220, 150))
-    base.alpha_composite(glow.filter(ImageFilter.GaussianBlur(18)))
-    ring = Image.new('RGBA', base.size, (0, 0, 0, 0))
-    ImageDraw.Draw(ring).ellipse((cx - 51, cy - 51, cx + 51, cy + 51), fill=(255, 255, 255, 255))
-    base.alpha_composite(ring)
-    base.alpha_composite(avatar_canvas, (cx - AVATAR_SIZE // 2, cy - AVATAR_SIZE // 2))
-
-    name = str(display_name or 'Discord User')
-    layer = Image.new('RGBA', base.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(layer)
-    font = _fit_name_font(draw, name)
-    bbox = draw.textbbox((0, 0), name, font=font)
-    tw = bbox[2] - bbox[0]; th = bbox[3] - bbox[1]
-    tx = NAME_CENTER_X - tw / 2; ty = NAME_Y - th / 2
-    pad_x, pad_y = 18, 8
-    plate = (tx - pad_x, ty - pad_y, tx + tw + pad_x, ty + th + pad_y)
-    draw.rounded_rectangle(plate, radius=16, fill=(255,255,255,205), outline=(91,58,210,120), width=2)
-    draw.text((tx + 2, ty + 2), name, font=font, fill=(40, 18, 105, 80))
-    draw.text((tx, ty), name, font=font, fill=(50, 22, 155, 255))
-    base.alpha_composite(layer)
-
-    output = io.BytesIO()
-    base.save(output, format='PNG', optimize=True)
-    output.seek(0)
-    return discord.File(output, filename=f'xguard-{kind}-{filename_id}.png')
-
-async def _dynamic_member_banner(member, kind):
-    avatar_bytes = await _download_member_avatar(member)
-    # Use the actual Discord username. This is the same identity shown by Discord
-    # even when the member has a different server nickname/display name.
-    username = member.name or member.display_name or 'Discord User'
-    return await _dynamic_member_banner_identity(avatar_bytes, username, kind, member.id)
-
 
 settings_cache = {}
 settings_cache_at = {}
@@ -190,7 +65,7 @@ def health_root():
 
 @health.post('/dashboard/member-message-test')
 def dashboard_member_message_test():
-    """Authenticated dashboard bridge: render the same dynamic banner used by real member events."""
+    """Authenticated dashboard bridge: send the same static welcome/goodbye embed used by member events."""
     try:
         auth = request.headers.get('Authorization', '')
         if auth != f'Bot {DISCORD_TOKEN}':
@@ -537,21 +412,11 @@ async def _member_embed(settings, member, kind):
     if title.strip(): embed.title = title
     if description.strip(): embed.description = description
     files=[]
-    dynamic_key = 'welcomeDynamicBanner' if kind == 'welcome' else 'goodbyeDynamicBanner'
-    if settings.get(dynamic_key, True):
-        try:
-            banner_file = await _dynamic_member_banner(member, kind)
-            embed.set_image(url=f'attachment://{banner_file.filename}')
-            files.append(banner_file)
-        except Exception as exc:
-            log.exception('dynamic %s banner generation failed', kind)
-            raise RuntimeError(f'Dynamic {kind} banner generation failed: {exc}') from exc
-    else:
-        image_file=await _download_member_image(image, f'{kind}-image')
-        if image_file:
-            embed.set_image(url=f'attachment://{image_file.filename}'); files.append(image_file)
-        elif image and str(image).strip().startswith(('http://','https://')):
-            embed.set_image(url=str(image).strip())
+    image_file=await _download_member_image(image, f'{kind}-image')
+    if image_file:
+        embed.set_image(url=f'attachment://{image_file.filename}'); files.append(image_file)
+    elif image and str(image).strip().startswith(('http://','https://')):
+        embed.set_image(url=str(image).strip())
     thumb_file=await _download_member_image(thumbnail, f'{kind}-thumb')
     if thumb_file:
         embed.set_thumbnail(url=f'attachment://{thumb_file.filename}'); files.append(thumb_file)
